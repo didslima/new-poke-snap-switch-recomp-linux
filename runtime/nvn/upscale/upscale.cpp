@@ -14,12 +14,8 @@
 // Photo safety: a submit whose lists bind the Evaluation depth target or a 360x240 photo/thumbnail target is a photo frame:
 // it is drawn unjittered and not upscaled (the game's own final pass reads the scene colour), and the next frames start a new
 // history. Check with SNAP_UPSCALE_LOG=1 ("photo" lines).
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -58,22 +54,34 @@ int g_active = BK_OFF;
 bool g_inited[4] = {};
 bool g_failed[4] = {};
 
+bool EqualI(const char* a, const char* b) {
+  if (!a || !b) return a == b;
+  while (*a && *b) {
+    if (std::tolower(static_cast<unsigned char>(*a)) != std::tolower(static_cast<unsigned char>(*b))) {
+      return false;
+    }
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
+
 void Parse() {
   if (C.parsed) return;
   C.parsed = true;
   if (const char* u = getenv("SNAP_UPSCALER")) {
-    if (!_stricmp(u, "dlss")) C.want = BK_DLSS;
-    else if (!_stricmp(u, "dlaa")) { C.want = BK_DLSS; C.dlaa = true; }
-    else if (!_stricmp(u, "fsr")) C.want = BK_FSR;
-    else if (!_stricmp(u, "xess")) C.want = BK_XESS;
-    else if (*u && _stricmp(u, "off")) Logf("unknown SNAP_UPSCALER '%s' (off, dlss, dlaa, fsr, xess): off", u);
+    if (EqualI(u, "dlss")) C.want = BK_DLSS;
+    else if (EqualI(u, "dlaa")) { C.want = BK_DLSS; C.dlaa = true; }
+    else if (EqualI(u, "fsr")) C.want = BK_FSR;
+    else if (EqualI(u, "xess")) C.want = BK_XESS;
+    else if (*u && !EqualI(u, "off")) Logf("unknown SNAP_UPSCALER '%s' (off, dlss, dlaa, fsr, xess): off", u);
   }
   int q = 0;  // unset = native: the options menu default is "native" and set_of drops default values, so the env var is absent then
   if (const char* e = getenv("SNAP_UPSCALE_QUALITY")) {
-    if (!_stricmp(e, "native") || !_stricmp(e, "dlaa")) q = 0;
-    else if (!_stricmp(e, "quality")) q = 1;
-    else if (!_stricmp(e, "balanced")) q = 2;
-    else if (!_stricmp(e, "performance")) q = 3;
+    if (EqualI(e, "native") || EqualI(e, "dlaa")) q = 0;
+    else if (EqualI(e, "quality")) q = 1;
+    else if (EqualI(e, "balanced")) q = 2;
+    else if (EqualI(e, "performance")) q = 3;
     else Logf("unknown SNAP_UPSCALE_QUALITY '%s' (native, quality, balanced, performance): native", e);
   }
   if (C.dlaa) q = 0;
@@ -164,9 +172,11 @@ void DeviceCreated(const DeviceCtx& c) {
 }
 
 void Shutdown() {
-  if (g_inited[BK_DLSS]) dlss::Release();
+  dlss::Release();
   if (g_inited[BK_FSR]) fsr::Release();
   if (g_inited[BK_XESS]) xess::Release();
+  g_active = BK_OFF;
+  for (int i = 0; i < 4; i++) { g_inited[i] = false; g_failed[i] = false; }
 }
 
 // ---- used by the NVN side below ----
@@ -265,7 +275,7 @@ struct State {
   float nearZ = 0.1f, farZ = 1000.f, fovY = 0.6f;
   bool invDepth = true, infFar = true;   // from the projection (reversed infinite in the course; checked per frame)
   bool reset = true;
-  LARGE_INTEGER lastEval{};
+  std::chrono::steady_clock::time_point lastEval{};
   // probe / stats
   int probeDraws = 0, probePresent = -1;
   uint64_t frames = 0, evals = 0, holds = 0, cuts = 0, noCam = 0, photoSubmits = 0, missed = 0, lateHold = 0, shutterHolds = 0;
@@ -275,7 +285,9 @@ struct State {
   int lastEvalPresent = -100;
 } U;
 
-double Now() { LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return (double)t.QuadPart * 1000.0 / (double)f.QuadPart; }
+double Now() {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // SNAP_UPSCALE_AB=<P> (test aid): presents in odd blocks of P are rendered native and unjittered (like a photo frame), so
 // frames N and N+1 at a block edge give a same-view native vs upscaled pair; the history is kept across the native block.
@@ -387,14 +399,16 @@ bool EnsureMv(uint32_t w, uint32_t h) {
 }
 
 TextureImpl* EnsureOut(TextureImpl* c, uint32_t ow, uint32_t oh) {
-  if (U.out && U.out->HW() == ow && U.out->HH() == oh) return U.out;
+  if (U.out && U.out->HW() == ow && U.out->HH() == oh && U.out->wide == c->wide) return U.out;
   if (U.out) { vkDeviceWaitIdle(U.h->device); DestroyTexture(U.out); U.out = nullptr; }
   auto* t = new TextureImpl();
   t->host = c->host; t->b = c->b; t->fi = c->fi;
-  t->hostW = ow; t->hostH = oh; t->scale = (float)ow / (float)c->b.width;
+  t->hostW = ow; t->hostH = oh;
+  t->wide = c->wide;
+  t->scale = (float)oh / (float)std::max(1, c->b.height);
   if (!t->EnsureImage()) { delete t; return nullptr; }
   U.out = t;
-  Logf("output image %ux%u RGBA16F", ow, oh);
+  Logf("output image %ux%u RGBA16F (wide %.4f)", ow, oh, t->wide);
   return t;
 }
 
@@ -538,6 +552,14 @@ static void Resolve(ReplayCtx& cx) {
     double d2 = 0, dot = 0;
     for (int i = 0; i < 3; i++) { const double d = U.eye[i] - U.prevEye[i]; d2 += d * d; dot += U.fwd[i] * U.prevFwd[i]; }
     if (std::sqrt(d2) > 5.0 || dot < std::cos(30.0 * 3.14159265358979 / 180.0)) { cut = true; U.cuts++; }
+    if (!cut) {
+      const double p0 = std::fabs(U.cur.m[0][0]), p1 = std::fabs(U.prev.m[0][0]);
+      const double q0 = std::fabs(U.cur.m[1][1]), q1 = std::fabs(U.prev.m[1][1]);
+      if ((p0 > 1e-6 && std::fabs(p0 - p1) / p0 > 0.05) || (q0 > 1e-6 && std::fabs(q0 - q1) / q0 > 0.05)) {
+        cut = true; U.cuts++;
+        if (front::LogLevel()) Logf("p%d camera projection change -> reset", g_presentCount);
+      }
+    }
   }
   if (!U.haveCur) U.noCam++;
   // motion vectors
@@ -596,10 +618,13 @@ static void Resolve(ReplayCtx& cx) {
   e.reset = U.reset || cut;
   e.hdr = true;
   e.invDepth = U.invDepth; e.infFar = U.infFar;   // read from the projection: reversed infinite z in the game (ndc 1 = near)
-  LARGE_INTEGER now; QueryPerformanceCounter(&now);
-  { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
-    const double dt = U.lastEval.QuadPart ? (double)(now.QuadPart - U.lastEval.QuadPart) * 1000.0 / (double)f.QuadPart : 0;
-    e.dtMs = dt > 0 && dt < 100 ? (float)dt : 16.67f; }
+  const auto now = std::chrono::steady_clock::now();
+  if (U.lastEval.time_since_epoch().count() != 0) {
+    const double dt = std::chrono::duration<double, std::milli>(now - U.lastEval).count();
+    e.dtMs = dt > 0 && dt < 100 ? (float)dt : 16.67f;
+  } else {
+    e.dtMs = 16.67f;
+  }
   U.lastEval = now;
   e.nearZ = U.nearZ; e.farZ = U.farZ; e.fovY = U.fovY;
   // the barrier the backends need after their own work is the replay's: `out` goes GENERAL -> sampled at the final pass
@@ -613,7 +638,7 @@ static void Resolve(ReplayCtx& cx) {
     for (int i = 0; i < ncmp; i++) {
       TextureImpl*& co = U.cmpOut[cmp[i]];
       if (!co) {
-        co = new TextureImpl(); co->host = o->host; co->b = o->b; co->fi = o->fi; co->hostW = ow; co->hostH = oh; co->scale = o->scale;
+        co = new TextureImpl(); co->host = o->host; co->b = o->b; co->fi = o->fi; co->hostW = ow; co->hostH = oh; co->wide = o->wide; co->scale = o->scale;
         if (!co->EnsureImage()) { delete co; co = nullptr; continue; }
         if (i == 0) Logf("compare: %d backends upscale every frame; present %% %d picks the shown one (0 = %s)", ncmp, ncmp, front::BackendName(cmp[0]));
       }

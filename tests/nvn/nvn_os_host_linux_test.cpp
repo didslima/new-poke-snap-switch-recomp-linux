@@ -9,7 +9,8 @@
 #include "nvn_hdr.h"
 #include "nvn_shot.h"
 #include "ui/ui_present.h"
-#include "upscale/upscale_nvn.h"
+#include "upscale/upscaler.h"
+#include "upscale/framegen.h"
 
 #ifdef HLE_WITH_SDL3
 #include <SDL3/SDL.h>
@@ -311,11 +312,8 @@ void test_vulkan_surface_and_upscale_stubs() {
   snap_crashlog_fatal("test", "noop");
 
   // 3. Upscaler & optional Windows-only feature stubs report unsupported explicitly.
-  float sc = 1.0f, oc = 1.0f;
-  CHECK(!nvn::UpscaleApplyPolicy(&sc, &oc));
-  float jx = 1.0f, jy = 1.0f;
-  nvn::UpscaleSceneJitter(&jx, &jy);
-  CHECK(jx == 0.0f && jy == 0.0f);
+  CHECK(!snap_upscale::xess::Load());
+  CHECK(!snap_framegen::Wanted());
   CHECK(!nvn::FgWanted());
   CHECK(!nvn::FgActive());
   CHECK(nvn::FgRecordGenerate(nullptr, VK_NULL_HANDLE, nullptr) == VK_NULL_HANDLE);

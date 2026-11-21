@@ -145,6 +145,8 @@ windows  runtime/nvn/nvn_os_host_win32.cpp
 linux    runtime/nvn/linux/nvn_os_host_posix.cpp
 linux    runtime/nvn/linux/nvn_optional_stubs.cpp
 linux    runtime/nvn/linux/nvn_upscale_stub.cpp
+linux    runtime/nvn/linux/upscale_dlss_posix.cpp   # Linux libnvidia-ngx.so.1 loader and Itanium C++ ABI vtable layout
+linux    runtime/nvn/linux/upscale_fsr_linux.cpp   # native Linux AMD FSR 3.1.4 Vulkan Super Resolution backend
 shared   runtime/nvn/nvn_pace.cpp
 shared   runtime/nvn/nvn_perf.cpp
 shared   runtime/nvn/nvn_pipeline.cpp
@@ -165,8 +167,9 @@ shared   runtime/nvn/nvn_vk.cpp
 shared   runtime/nvn/nvn_wide.cpp
 shared   runtime/nvn/nvn_xfer.cpp
 windows  runtime/nvn/upscale/framegen.cpp   # #include <windows.h>, DWORD, GetLastError ...
-windows  runtime/nvn/upscale/upscale.cpp   # #include <windows.h>, NOMINMAX, QueryPerformanceCounter ...
-windows  runtime/nvn/upscale/upscale_dlss.cpp   # #include <windows.h>, DWORD, GetModuleHandleW ...
+shared   runtime/nvn/upscale/upscale.cpp   # portable temporal upscaler front-end (jitter, depth, motion vectors)
+shared   runtime/nvn/upscale/upscale_dlss.cpp   # portable DLSS / DLAA NGX Vulkan backend
+windows  runtime/nvn/upscale/upscale_dlss_win32.cpp   # Windows _nvngx.dll loader and MSVC vtable layout
 windows  runtime/nvn/upscale/upscale_fsr.cpp   # #include <windows.h>, DWORD, GetLastError ...
 windows  runtime/nvn/upscale/upscale_xess.cpp   # #include <windows.h>, DWORD, GetProcAddress ...
 windows  runtime/os/hostprof.cpp   # #include <psapi.h>, #include <tlhelp32.h>, #include <windows.h> ...

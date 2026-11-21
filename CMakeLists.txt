@@ -37,8 +37,10 @@ if(UNIX AND NOT APPLE)
   # strict aliasing, warnings off as there). A shared file that stops compiling on Linux fails this target.
   add_library(snap_portable_objects OBJECT ${SNAP_LINUX_SOURCES})
   target_include_directories(snap_portable_objects PRIVATE
-    runtime host runtime/nvn runtime/ui runtime/ui/third_party/imgui runtime/hle runtime/fx/ocean_fft)
+    runtime host runtime/nvn runtime/ui runtime/ui/third_party/imgui runtime/hle runtime/fx/ocean_fft
+    third_party/FidelityFX third_party/FidelityFX/sdk/include third_party/FidelityFX/sdk/src/backends/shared)
   target_compile_features(snap_portable_objects PRIVATE cxx_std_20)
+  target_compile_definitions(snap_portable_objects PRIVATE FFX_GCC=1)
   target_compile_options(snap_portable_objects PRIVATE -w -march=x86-64-v3 -fno-strict-aliasing)
   target_link_libraries(snap_portable_objects PRIVATE Vulkan::Headers)
   if(SNAP_HAVE_SDL3)
@@ -367,6 +369,26 @@ if(UNIX AND NOT APPLE)
   endif()
   add_test(NAME nvn_os_host_linux COMMAND snap_nvn_os_host_linux_test)
 
+  # Milestone 1 (FSR 3.1 SR Linux): MIT-licensed FidelityFX SDK v1.1.4 subset (fsr3upscaler + Vulkan backend).
+  add_library(snap_ffx_fsr3_linux STATIC
+    third_party/FidelityFX/sdk/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp
+    third_party/FidelityFX/sdk/src/backends/vk/ffx_vk.cpp
+    third_party/FidelityFX/sdk/src/shared/ffx_assert.cpp
+    third_party/FidelityFX/sdk/src/shared/ffx_breadcrumbs_list.cpp
+    third_party/FidelityFX/sdk/src/shared/ffx_message.cpp
+    third_party/FidelityFX/sdk/src/shared/ffx_object_management.cpp)
+  target_include_directories(snap_ffx_fsr3_linux
+    PUBLIC third_party/FidelityFX third_party/FidelityFX/sdk/include third_party/FidelityFX/sdk/src/backends/shared
+    PRIVATE third_party/FidelityFX/sdk/src/shared)
+  target_compile_features(snap_ffx_fsr3_linux PRIVATE cxx_std_17)
+  target_compile_definitions(snap_ffx_fsr3_linux PUBLIC FFX_GCC=1)
+  target_compile_options(snap_ffx_fsr3_linux PRIVATE
+    -w -march=x86-64-v3 -include ${PROJECT_SOURCE_DIR}/third_party/FidelityFX/ffx_compat.h)
+  target_link_libraries(snap_ffx_fsr3_linux PUBLIC Vulkan::Headers)
+  if(Vulkan_FOUND)
+    target_link_libraries(snap_ffx_fsr3_linux PUBLIC Vulkan::Vulkan)
+  endif()
+
   set(SNAP_LINUX_NVN_RENDERER_SOURCES ${SNAP_LINUX_SOURCES})
   list(FILTER SNAP_LINUX_NVN_RENDERER_SOURCES INCLUDE REGEX "^runtime/(nvn|fx/ocean_fft|os|hle|audio|ui|mods)/")
   add_library(snap_nvn_renderer_linux STATIC
@@ -382,7 +404,7 @@ if(UNIX AND NOT APPLE)
   elseif(EXISTS "${SNAP_SHADER_HARNESS_DLL}")
     target_compile_definitions(snap_nvn_renderer_linux PRIVATE NVN_HARNESS_DLL="${SNAP_SHADER_HARNESS_DLL}")
   endif()
-  target_link_libraries(snap_nvn_renderer_linux PUBLIC Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
+  target_link_libraries(snap_nvn_renderer_linux PUBLIC snap_ffx_fsr3_linux Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
   if(SNAP_HAVE_SDL3)
     target_compile_definitions(snap_nvn_renderer_linux PUBLIC HLE_WITH_SDL3)
     target_link_libraries(snap_nvn_renderer_linux PUBLIC SDL3::SDL3)
