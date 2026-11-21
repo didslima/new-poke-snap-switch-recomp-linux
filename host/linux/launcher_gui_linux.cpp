@@ -32,6 +32,7 @@ enum class PickerTarget {
     MainLib,
     SdkLib,
     Romfs,
+    DataDir,
 };
 
 struct PickerState {
@@ -292,7 +293,7 @@ int run_launcher_gui(const std::string &argv0, const std::string &initial_error)
         SDL_Window *window = SDL_CreateWindow(
             "New Pokémon Snap Recomp — Launcher",
             820,
-            600,
+            636,
             SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
         if (!window) {
             std::fprintf(stderr, "snap_boot_linux: failed to create launcher window: %s\n", SDL_GetError());
@@ -333,13 +334,14 @@ int run_launcher_gui(const std::string &argv0, const std::string &initial_error)
         SDL_SetTextureBlendMode(font_tex, SDL_BLENDMODE_BLEND);
         io.Fonts->SetTexID(static_cast<ImTextureID>(reinterpret_cast<intptr_t>(font_tex)));
 
-        std::array<char, 1024> main_elf_buf{}, sdk_elf_buf{}, main_lib_buf{}, sdk_lib_buf{}, romfs_buf{};
+        std::array<char, 1024> main_elf_buf{}, sdk_elf_buf{}, main_lib_buf{}, sdk_lib_buf{}, romfs_buf{}, data_dir_buf{};
         auto sync_buffers_from_cfg = [&]() {
             copy_to_buf(cfg.main_elf, main_elf_buf);
             copy_to_buf(cfg.sdk_elf, sdk_elf_buf);
             copy_to_buf(cfg.main_lib, main_lib_buf);
             copy_to_buf(cfg.sdk_lib, sdk_lib_buf);
             copy_to_buf(cfg.romfs, romfs_buf);
+            copy_to_buf(cfg.data_dir, data_dir_buf);
         };
         sync_buffers_from_cfg();
 
@@ -403,6 +405,7 @@ int run_launcher_gui(const std::string &argv0, const std::string &initial_error)
                             case PickerTarget::MainLib: cfg.main_lib = picker->chosen_path; break;
                             case PickerTarget::SdkLib: cfg.sdk_lib = picker->chosen_path; break;
                             case PickerTarget::Romfs: cfg.romfs = picker->chosen_path; break;
+                            case PickerTarget::DataDir: cfg.data_dir = picker->chosen_path; break;
                             case PickerTarget::None: break;
                         }
                         sync_buffers_from_cfg();
@@ -488,7 +491,7 @@ int run_launcher_gui(const std::string &argv0, const std::string &initial_error)
                 SDL_ShowOpenFolderDialog(on_dialog_done, ctx, window, def_loc, false);
             };
 
-            ImGui::BeginChild("##ComponentsBox", ImVec2(0.0f, 252.0f), ImGuiChildFlags_Borders);
+            ImGui::BeginChild("##ComponentsBox", ImVec2(0.0f, 286.0f), ImGuiChildFlags_Borders);
             ImGui::TextUnformatted("Required Components");
             ImGui::SameLine(ImGui::GetContentRegionAvail().x - 105.0f);
             if (ImGui::Button("Auto-Detect", ImVec2(110.0f, 0.0f))) {
@@ -533,6 +536,8 @@ int run_launcher_gui(const std::string &argv0, const std::string &initial_error)
                           [&]() { open_file_picker(PickerTarget::SdkLib, "Static Libraries", "a", cfg.sdk_lib); });
             draw_path_row("romfs", "ROMFS Folder", comp.romfs_ok, romfs_buf, cfg.romfs,
                           [&]() { open_folder_picker(PickerTarget::Romfs, cfg.romfs); });
+            draw_path_row("data_dir", "Save / Data Dir", !cfg.data_dir.empty(), data_dir_buf, cfg.data_dir,
+                          [&]() { open_folder_picker(PickerTarget::DataDir, cfg.data_dir); });
 
             ImGui::EndChild();
             ImGui::Spacing();

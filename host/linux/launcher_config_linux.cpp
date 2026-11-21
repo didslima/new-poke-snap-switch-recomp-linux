@@ -128,6 +128,16 @@ std::string launcher_config_path() {
     return (fs::u8path(cfg_home) / "new-pokemon-snap-recomp" / "config").string();
 }
 
+std::string default_data_dir() {
+    std::string data_home = env_str("XDG_DATA_HOME");
+    if (data_home.empty()) {
+        const std::string home = env_str("HOME");
+        if (home.empty()) return {};
+        data_home = (fs::u8path(home) / ".local" / "share").string();
+    }
+    return (fs::u8path(data_home) / "SnapRecomp").string();
+}
+
 bool load_launcher_config(const std::string &path, LauncherConfig &cfg, std::string &err) {
     err.clear();
     if (path.empty()) return true;
@@ -157,6 +167,7 @@ bool load_launcher_config(const std::string &path, LauncherConfig &cfg, std::str
         else if (k == "main_lib") cfg.main_lib = v;
         else if (k == "sdk_lib") cfg.sdk_lib = v;
         else if (k == "romfs") cfg.romfs = v;
+        else if (k == "data_dir") cfg.data_dir = v;
         else if (k == "window_mode") cfg.window_mode = sanitize_window_mode(v);
         else if (k == "width") {
             const int w = std::atoi(v.c_str());
@@ -199,6 +210,7 @@ bool save_launcher_config(const std::string &path, const LauncherConfig &cfg, st
         out << "main_lib=" << cfg.main_lib << "\n";
         out << "sdk_lib=" << cfg.sdk_lib << "\n";
         out << "romfs=" << cfg.romfs << "\n";
+        out << "data_dir=" << cfg.data_dir << "\n";
         out << "window_mode=" << sanitize_window_mode(cfg.window_mode) << "\n";
         out << "width=" << cfg.width << "\n";
         out << "height=" << cfg.height << "\n";
@@ -335,6 +347,11 @@ void auto_detect_launcher_paths(LauncherConfig &cfg, const std::string &exe_dir)
         }
         cfg.romfs = first_existing_dir(cands);
     }
+
+    if (cfg.data_dir.empty()) {
+        const std::string env_dd = env_str("SNAP_DATA_DIR");
+        cfg.data_dir = !env_dd.empty() ? env_dd : default_data_dir();
+    }
 }
 
 std::vector<std::string> build_launch_cli_args(const std::string &exe_path, const LauncherConfig &cfg) {
@@ -354,6 +371,10 @@ std::vector<std::string> build_launch_cli_args(const std::string &exe_path, cons
     args.push_back(cfg.sdk_lib);
     args.push_back("--romfs");
     args.push_back(cfg.romfs);
+    if (!cfg.data_dir.empty() && cfg.data_dir != default_data_dir()) {
+        args.push_back("--data-dir");
+        args.push_back(cfg.data_dir);
+    }
     args.push_back("--" + mode);
     args.push_back("--width");
     args.push_back(std::to_string(w));

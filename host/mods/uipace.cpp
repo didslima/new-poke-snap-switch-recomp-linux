@@ -26,8 +26,6 @@
 //   SNAP_PTR_PACE=0    kill switch for the pointer time (a stopped clock moves the pointer per frame, as without this file).
 //   SNAP_UI_PACE_HOVER=0  kill switch for keeping the pointer's "over an entry" flag on frames without a step (the cursor arc blinks again).
 //   SNAP_UI_PACE_TRACE=1  logs the handler counts every 5 s ("[uipace]" in stderr).
-#include <windows.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -119,8 +117,12 @@ std::atomic<uint64_t> g_ptr_obj{0};
 int g_ptr_hover = -1;   // -1 = not known yet
 bool g_prev_step = true;
 
+inline bool ptr_valid(uint64_t p) {
+    return p >= 0x10000ull;
+}
+
 void hover_seen(uint64_t ptr) {
-    if (!ptr || IsBadWritePtr((void*)(ptr + kPtrHoverOff), 1)) return;
+    if (!ptr_valid(ptr + kPtrHoverOff)) return;
     g_ptr_obj.store(ptr, std::memory_order_relaxed);
     uint8_t* f = (uint8_t*)(ptr + kPtrHoverOff);
     if (g_prev_step) g_ptr_hover = *f;
@@ -198,7 +200,7 @@ extern "C" void rt_gm_ui_pointer(Cpu* c) {
         const uint64_t now = now_ns();
         (t > 0.0f ? n_time : n_zero)++;
         const uint64_t o = c->x[21];
-        if (o && !IsBadReadPtr((const void*)(o + 0x118), 8)) {
+        if (o && ptr_valid(o + 0x118)) {
             float x, y;
             std::memcpy(&x, (const void*)(o + 0x118), 4);
             std::memcpy(&y, (const void*)(o + 0x11c), 4);

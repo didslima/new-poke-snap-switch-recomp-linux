@@ -14,6 +14,7 @@ struct LauncherConfig {
     std::string main_lib;
     std::string sdk_lib;
     std::string romfs;
+    std::string data_dir;
     std::string window_mode = "fullscreen"; // fullscreen | windowed | borderless
     int width = 1920;
     int height = 1080;
@@ -33,6 +34,10 @@ struct ComponentStatus {
 
 // Returns $XDG_CONFIG_HOME/new-pokemon-snap-recomp/config (fallback $HOME/.config/...).
 std::string launcher_config_path();
+
+// Returns default shared data root: $XDG_DATA_HOME/SnapRecomp
+// (fallback $HOME/.local/share/SnapRecomp).
+std::string default_data_dir();
 
 // Loads key=value config if it exists; missing file is not an error (returns true with defaults).
 bool load_launcher_config(const std::string &path, LauncherConfig &cfg, std::string &err);

@@ -228,7 +228,7 @@ if(UNIX AND NOT APPLE)
   if(EXISTS "${SNAP_AOT_MAIN_LIB}" AND EXISTS "${SNAP_AOT_SDK_LIB}")
     snap_os_test(snap_boot_linux ${SNAP_LINUX_RUNNER_SOURCES}
                  host/linux/init_linux.cpp host/linux/hooks_mods_stub.cpp host/linux/window_sdl3.cpp
-                 host/loader.cpp host/hooks.cpp host/guest_tls_hooks.cpp host/mods/drpfast.cpp
+                 host/loader.cpp host/hooks.cpp host/guest_tls_hooks.cpp host/mods/drpfast.cpp host/mods/uipace.cpp
                  host/abi_audio.cpp runtime/audio/linux/audio_sdl3.cpp runtime/hle/linux/input_backend_sdl3.cpp
                  generated/unimplemented.cpp generated/boot/nvn_bridge.cpp)
     target_compile_definitions(snap_boot_linux PRIVATE SNAP_LINUX_HAS_AOT=1)
@@ -274,12 +274,16 @@ if(UNIX AND NOT APPLE)
                host/linux/init_linux.cpp host/linux/crash_linux.cpp host/linux/preflight_linux.cpp
                host/linux/hooks_mods_stub.cpp host/linux/window_sdl3.cpp
                host/loader.cpp host/elf_check.cpp host/hooks.cpp
-               host/guest_tls_hooks.cpp host/mods/drpfast.cpp
+               host/guest_tls_hooks.cpp host/mods/drpfast.cpp host/mods/uipace.cpp
                host/abi_audio.cpp generated/unimplemented.cpp generated/boot/nvn_bridge.cpp)
   target_include_directories(snap_init_linux_test PRIVATE host)
   target_compile_options(snap_init_linux_test PRIVATE -w)
   target_link_libraries(snap_init_linux_test PRIVATE snap_nvn_renderer_linux)
   add_test(NAME init_linux COMMAND snap_init_linux_test)
+
+  snap_os_test(snap_uipace_linux_test tests/mods/uipace_test.cpp)
+  target_include_directories(snap_uipace_linux_test PRIVATE host)
+  add_test(NAME uipace_linux COMMAND snap_uipace_linux_test)
 
   snap_os_test(snap_hle_core_linux_test tests/platform/hle_core_linux_test.cpp ${SNAP_LINUX_HLE_CORE_SOURCES} runtime/os/perf.cpp runtime/os/linux/os_host_posix.cpp)
   target_compile_options(snap_hle_core_linux_test PRIVATE -w)

@@ -14,6 +14,7 @@
 #include "guest_tls_hooks.h"
 #include "hle/hle.h"
 #include "hle/hle_config.h"
+#include "hle/live.h"
 #include "loader.h"
 #include "nvn/nvn_host.h"
 #include "os/os.h"
@@ -34,6 +35,35 @@ HostWindow g_host_win;
 std::atomic<uint64_t> g_presents{0};
 std::atomic<uint64_t> g_submits{0};
 std::atomic<bool> g_hooks_active{false};
+
+extern "C" uint64_t snap_present_count() {
+    return g_presents.load(std::memory_order_relaxed);
+}
+
+void apply_frame_rate_target() {
+    static std::atomic<unsigned> seen{0};
+    if (!hle::live::changed(seen)) return;
+
+    int target = 60;
+    {
+        hle::live::EnvRead env_read;
+        const char *value = std::getenv("SNAP_FPS");
+        if (value && *value && std::strcmp(value, "default") != 0) {
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end && *end == '\0' && (parsed == 72 || parsed == 90 || parsed == 120 || parsed == 144 || parsed == 165 || parsed == 240)) {
+                target = static_cast<int>(parsed);
+            } else if (parsed != 60) {
+                std::fprintf(stderr, "[highfps] SNAP_FPS=%s ignored (use default, 60, 72, 90, 120, 144, 165 or 240)\n", value);
+            }
+        }
+    }
+
+    nvnHostSetFramePacing(static_cast<double>(target));
+    const int cap = snap_window_frame_cap();
+    std::fprintf(stderr, "[highfps] pacing target %d Hz%s\n", target,
+                 cap > 0 && cap < target ? " (lowered by the frame-rate limit option)" : "");
+}
 
 bool ultrawide_disabled_by_env() {
     const char *uw = std::getenv("SNAP_ULTRAWIDE");
@@ -76,6 +106,7 @@ void vi_get_native_window_host(Cpu *c) {
 void hook_present(void *, int slot, int w, int h) {
     const WindowEvents ev = pump_host_window_events();
     const uint64_t n = ++g_presents;
+    apply_frame_rate_target();
     if (n <= 3 || n % 30 == 0) {
         loader::trace("nvn: present #%llu slot %d %dx%d (submits %llu)",
                       static_cast<unsigned long long>(n), slot, w, h,
@@ -223,6 +254,10 @@ bool init_guest_runtime(const BootOpts &opts, bool validate_archives, InitResult
     loader::install_libc_overrides();
     hle::init_trace_from_env();
     hle::load_config("");
+    hle::activate_profiles();
+    // Apply the profile's frame-rate target before the first NVN present. The present hook also
+    // calls this helper so changes made in the live options menu take effect without restarting.
+    apply_frame_rate_target();
     hle::bind_all(hle_bind_one, nullptr);
     out.hle_overrides_bound = hle::overrides().size();
     hle::set_log_sink([](const char *l, size_t n) { loader::trace("%.*s", (int)n, l); });

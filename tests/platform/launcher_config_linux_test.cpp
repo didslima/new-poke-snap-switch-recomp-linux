@@ -73,6 +73,7 @@ int main() {
         wcfg.main_lib = (base / "files with spaces" / "libsnap_main.a").string();
         wcfg.sdk_lib = (base / "files with spaces" / "libsnap_sdk.a").string();
         wcfg.romfs = (base / "files with spaces" / "romfs").string();
+        wcfg.data_dir = (base / "files with spaces" / "profiles" / "p1").string();
         wcfg.window_mode = "windowed";
         wcfg.width = 2560;
         wcfg.height = 1440;
@@ -89,6 +90,7 @@ int main() {
         CHECK(rcfg.main_lib == wcfg.main_lib);
         CHECK(rcfg.sdk_lib == wcfg.sdk_lib);
         CHECK(rcfg.romfs == wcfg.romfs);
+        CHECK(rcfg.data_dir == wcfg.data_dir);
         CHECK(rcfg.window_mode == "windowed");
         CHECK(rcfg.width == 2560);
         CHECK(rcfg.height == 1440);
@@ -143,21 +145,33 @@ int main() {
         CHECK(st.main_lib_ok);
         CHECK(st.sdk_lib_ok);
         CHECK(st.romfs_ok);
+        CHECK(detected.data_dir == (base / "fake_home" / ".local" / "share" / "SnapRecomp").string());
 
-        // Build CLI args
+        // Default data_dir must NOT emit --data-dir (so activate_profiles() selects profiles/p1).
         detected.window_mode = "borderless";
         detected.width = 3440;
         detected.height = 1440;
         const auto args = snap_linux::build_launch_cli_args("/tmp/snap_boot_linux", detected);
         CHECK(!args.empty() && args.front() == "/tmp/snap_boot_linux");
         CHECK(args.back() == "--allow-guest-exec");
-        bool saw_romfs = false, saw_mode = false;
+        bool saw_romfs = false, saw_mode = false, saw_data_dir = false;
         for (size_t i = 0; i < args.size(); ++i) {
             if (args[i] == "--romfs" && i + 1 < args.size() && args[i + 1] == detected.romfs) saw_romfs = true;
+            if (args[i] == "--data-dir") saw_data_dir = true;
             if (args[i] == "--borderless") saw_mode = true;
         }
         CHECK(saw_romfs);
+        CHECK(!saw_data_dir);
         CHECK(saw_mode);
+
+        // Custom data_dir MUST emit --data-dir explicitly.
+        detected.data_dir = (base / "custom_data").string();
+        const auto custom_args = snap_linux::build_launch_cli_args("/tmp/snap_boot_linux", detected);
+        bool saw_custom_dd = false;
+        for (size_t i = 0; i + 1 < custom_args.size(); ++i) {
+            if (custom_args[i] == "--data-dir" && custom_args[i + 1] == detected.data_dir) saw_custom_dd = true;
+        }
+        CHECK(saw_custom_dd);
     }
 
     // 5. Desktop integration in isolated XDG_DATA_HOME (spaces + no duplicates)
