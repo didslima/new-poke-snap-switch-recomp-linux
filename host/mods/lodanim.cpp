@@ -496,6 +496,10 @@ void snap_lodanim_install() {
     }
     const char *uw = getenv("SNAP_ULTRAWIDE");   // the factor is set later (boot.cpp, once the window exists); h_tanf reads it on first use
     const bool wide = !(uw && (!_stricmp(uw, "off") || !strcmp(uw, "0")));
+    if (const char *cuw = getenv("SNAP_CUTSCENE_ULTRAWIDE"); cuw && cuw[0] != '\0' && strcmp(cuw, "0") != 0 && _stricmp(cuw, "off") != 0 && _stricmp(cuw, "false") != 0) {
+        static const WideSite kCutsceneSites[] = {{0x38cdbc, 9}, {0x29249c, 8}, {0x2973b0, 12}};
+        for (const auto &s : kCutsceneSites) if (g_wide_nsites < 8) g_wide_sites[g_wide_nsites++] = s;
+    }
     if (const char *ws = getenv("SNAP_WIDE_SITES")) {   // developer aid: more camera sites as main offset:register, e.g. 0x38cdbc:9
         for (const char *p = ws; *p && g_wide_nsites < 8;) {
             char *e;
