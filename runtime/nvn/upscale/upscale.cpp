@@ -264,6 +264,8 @@ struct State {
   int64_t lastPresentNs = 0;
   bool evaluated = false;     // this present
   bool lateDraw = false;      // this present drew into the scene targets after the upscale point (UpscaleOnDraw)
+  bool lateActive = false;    // multi-pass late-draw scene active (suppresses jitter/eval until clean frames finish)
+  int lateClean = 0;          // consecutive clean phase-2 frames after hold expires before clearing lateActive
   uint64_t lateDraws = 0;     // presents with late scene draws
   bool jitUsed = false;
   float jx = 0, jy = 0;
@@ -687,7 +689,7 @@ static void Resolve(ReplayCtx& cx) {
 
 static void CurJitter(const ReplayCtx& cx, float* jx, float* jy) {
   *jx = *jy = 0;
-  if (!U.on || U.fgOnly || U.phase != 1 || U.frameHold || !front::JitterOn() || !cx.rt[8] || cx.rt[8] != U.sceneDepth) return;
+  if (!U.on || U.fgOnly || U.phase != 1 || U.frameHold || U.lateActive || !front::JitterOn() || !cx.rt[8] || cx.rt[8] != U.sceneDepth) return;
   *jx = U.jx; *jy = U.jy;
 }
 
@@ -714,7 +716,7 @@ bool UpscaleOnSetRenderTargets(ReplayCtx& cx) {
     if (U.phase == 1 && d == U.sceneDepth && IsSceneColor(c0)) U.sceneColor = c0;
   } else if (U.phase == 1 && IsDisplay(c0)) {
     U.phase = 2;
-    if (!U.frameHold) Resolve(cx);
+    if (!U.frameHold && !U.lateActive) Resolve(cx);
   }
   if (front::LogLevel() && c0 && c0->b.width == 360 && c0->b.height == 240) {
     static int lastP = -1;
@@ -786,7 +788,10 @@ void UpscaleOnDraw(ReplayCtx& cx, const uint8_t* const* vsUbo, const uint64_t* v
     if (!off) {
       if (!U.lateDraw && front::LogLevel()) Logf("p%d scene draw after the upscale point: this present shows the native scene%s", g_presentCount, U.evaluated ? " (upscale dropped)" : "");
       if (!U.lateDraw) U.lateDraws++;
+      if (!U.lateActive && front::LogLevel()) Logf("p%d lateActive=1 (late scene draw detected; holding native until clean frame)", g_presentCount);
       U.lateDraw = true;
+      U.lateActive = true;
+      U.lateClean = 0;
       U.hold = std::max(U.hold, HoldScale(6));
     }
     return;
@@ -824,8 +829,20 @@ void UpscaleOnPresent() {
   }
   if (!U.on && !U.evaluated) return;
   if (U.phase == 1) U.missed++;
-  if (U.evaluated) U.lastEvalPresent = g_presentCount;
+  if (U.evaluated && !U.lateDraw) U.lastEvalPresent = g_presentCount;
   else if (g_presentCount - U.lastEvalPresent > 4 + 2 * AbPeriod()) U.reset = true;   // a longer gap (menus, photo select, loads) starts a new history
+  if (U.lateActive) {
+    if (U.phase == 2 && !U.lateDraw && !U.submitPhoto && U.hold == 0) {
+      if (++U.lateClean >= HoldScale(6)) {
+        U.lateActive = false;
+        U.lateClean = 0;
+        U.reset = true;
+        if (front::LogLevel()) Logf("p%d lateActive=0 (clean scene streak completed; resuming upscaler with reset)", g_presentCount);
+      }
+    } else if (U.lateDraw || U.submitPhoto) {
+      U.lateClean = 0;
+    }
+  }
   U.prevHeld = !U.evaluated && (U.frameHold || U.phase == 0);
   U.phase = 0; U.evaluated = false; U.lateDraw = false;
   if (U.hold > 0 && !U.submitPhoto) U.hold--;
