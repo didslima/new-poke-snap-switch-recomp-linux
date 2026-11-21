@@ -14,8 +14,13 @@
 
 namespace snap_hdr {
 
+float QueryDisplayPeak(void* nativeWindow); // 0 when the host cannot report the active display's HDR peak
+
 bool Requested();            // SNAP_HDR=hdr10|scrgb
-bool LiveChanged();          // once per present: true when the HDR rows changed and the swapchain has to be made again
+void NotifyDisplayChanged(); // called by host window event loop on display/HDR state change
+void UpdateDisplayPeak(float peak_nits); // thread-safe cache update from host window/event thread
+float CachedDisplayPeak();   // lock-free read of cached display peak (0 if unavailable/SDR)
+bool LiveChanged();          // once per present: true when the HDR rows or display HDR state changed and the swapchain has to be made again
 float Peak();
 float Paper();
 const char* ModeName();      // "itm" or "guided"

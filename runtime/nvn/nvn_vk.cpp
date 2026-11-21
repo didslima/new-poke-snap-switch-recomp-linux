@@ -1634,10 +1634,15 @@ bool WindowImpl::Recreate() {
   }
   if (ext.width == 0 || ext.height == 0) return false;  // minimized
 
+  constexpr uint32_t kMaxSurfaceFormats = 256;
   uint32_t n = 0;
-  vkGetPhysicalDeviceSurfaceFormatsKHR(h->phys, surface, &n, nullptr);
+  if (vkGetPhysicalDeviceSurfaceFormatsKHR(h->phys, surface, &n, nullptr) != VK_SUCCESS || n == 0) return false;
+  n = std::min(n, kMaxSurfaceFormats);
   std::vector<VkSurfaceFormatKHR> fm(n);
-  vkGetPhysicalDeviceSurfaceFormatsKHR(h->phys, surface, &n, fm.data());
+  const VkResult fmRes = vkGetPhysicalDeviceSurfaceFormatsKHR(h->phys, surface, &n, fm.data());
+  if (fmRes != VK_SUCCESS && fmRes != VK_INCOMPLETE) return false;
+  fm.resize(std::min<uint32_t>(n, (uint32_t)fm.size()));
+  if (fm.empty()) return false;
   const bool srgbSrc = !tex.empty() && tex[0]->fi && (tex[0]->fi->vk == VK_FORMAT_R8G8B8A8_SRGB || tex[0]->fi->vk == VK_FORMAT_B8G8R8A8_SRGB);
   const VkFormat want[2] = {srgbSrc ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM,
                             srgbSrc ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM};
@@ -1652,9 +1657,19 @@ bool WindowImpl::Recreate() {
     if (snap_hdr::PickFormat(fm.data(), (uint32_t)fm.size(), &hp, hwnd)) { pick = hp; hdr = true; }
   }
 
-  vkGetPhysicalDeviceSurfacePresentModesKHR(h->phys, surface, &n, nullptr);
-  std::vector<VkPresentModeKHR> pm(n);
-  vkGetPhysicalDeviceSurfacePresentModesKHR(h->phys, surface, &n, pm.data());
+  constexpr uint32_t kMaxPresentModes = 32;
+  uint32_t pmCount = 0;
+  std::vector<VkPresentModeKHR> pm;
+  if (vkGetPhysicalDeviceSurfacePresentModesKHR(h->phys, surface, &pmCount, nullptr) == VK_SUCCESS && pmCount > 0) {
+    pmCount = std::min(pmCount, kMaxPresentModes);
+    pm.resize(pmCount);
+    const VkResult pmRes = vkGetPhysicalDeviceSurfacePresentModesKHR(h->phys, surface, &pmCount, pm.data());
+    if (pmRes == VK_SUCCESS || pmRes == VK_INCOMPLETE) {
+      pm.resize(std::min<uint32_t>(pmCount, (uint32_t)pm.size()));
+    } else {
+      pm.clear();
+    }
+  }
   auto has = [&](VkPresentModeKHR m) { return std::find(pm.begin(), pm.end(), m) != pm.end(); };
   VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
   if (presentInterval <= 0) mode = has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR

@@ -16,6 +16,27 @@
 #endif
 
 extern "C" __attribute__((weak)) void snap_ui_on_sdl_event(const void*) {}
+namespace snap_hdr {
+void NotifyDisplayChanged();
+void UpdateDisplayPeak(float peak_nits);
+}
+
+#ifdef HLE_WITH_SDL3
+namespace {
+float query_sdl_hdr_peak(SDL_Window* win) {
+  if (!win || SDL_WasInit(SDL_INIT_VIDEO) == 0) return 0.0f;
+  const SDL_PropertiesID props = SDL_GetWindowProperties(win);
+  if (props == 0) return 0.0f;
+  // X11 does not expose HDR properties via SDL3; HDR_enabled stays false there.
+  if (!SDL_GetBooleanProperty(props, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false)) return 0.0f;
+  const float sdr_white_level = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.0f);
+  const float hdr_headroom = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
+  if (sdr_white_level <= 0.0f || hdr_headroom <= 1.0f) return 0.0f;
+  // In SDL_COLORSPACE_SRGB_LINEAR, 1.0 corresponds to 80 nits.
+  return sdr_white_level * 80.0f * hdr_headroom;
+}
+}  // namespace
+#endif
 
 namespace snap_linux {
 
@@ -105,6 +126,7 @@ bool HostWindow::create(const WindowConfig& cfg) {
   minimized_ = (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0;
   quit_requested_ = false;
   sync_sizes();
+  snap_hdr::UpdateDisplayPeak(query_sdl_hdr_peak(window_));
   return true;
 #else
   (void)cfg;
@@ -115,6 +137,7 @@ bool HostWindow::create(const WindowConfig& cfg) {
 
 void HostWindow::destroy() {
 #ifdef HLE_WITH_SDL3
+  snap_hdr::UpdateDisplayPeak(0.0f);
   if (window_) {
     SDL_DestroyWindow(window_);
     window_ = nullptr;
@@ -273,6 +296,15 @@ WindowEvents HostWindow::poll_events() {
         if (ev.window.windowID == window_id_) {
           sync_sizes();
           ev_out.display_changed = true;
+          snap_hdr::UpdateDisplayPeak(query_sdl_hdr_peak(window_));
+          snap_hdr::NotifyDisplayChanged();
+        }
+        break;
+      case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
+        if (ev.window.windowID == window_id_) {
+          ev_out.display_changed = true;
+          snap_hdr::UpdateDisplayPeak(query_sdl_hdr_peak(window_));
+          snap_hdr::NotifyDisplayChanged();
         }
         break;
       case SDL_EVENT_WINDOW_FOCUS_GAINED:

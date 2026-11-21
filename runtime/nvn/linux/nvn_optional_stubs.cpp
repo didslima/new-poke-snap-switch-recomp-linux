@@ -11,7 +11,6 @@
 #include "../nvn_framegen.h"
 #include "../nvn_freecam.h"
 #include "../nvn_hdphoto.h"
-#include "../nvn_hdr.h"
 #include "../nvn_shot.h"
 
 #include <cstdint>
@@ -79,30 +78,6 @@ void ShotShutdown() {}
 }  // namespace nvn
 
 extern "C" void nvnHostFreecamShot(void) {}
-
-namespace snap_hdr {
-
-bool Requested() { return false; }
-bool LiveChanged() { return false; }
-float Peak() { return 1000.0f; }
-float Paper() { return 200.0f; }
-const char* ModeName() { return "off"; }
-void AppendInstanceExt(std::vector<const char*>& /*ext*/) {}
-void AppendDeviceExt(VkPhysicalDevice /*phys*/, std::vector<const char*>& /*ext*/) {}
-void LoadDeviceFuncs(VkDevice /*dev*/) {}
-bool PickFormat(const VkSurfaceFormatKHR* /*fm*/, uint32_t /*n*/, VkSurfaceFormatKHR* /*out*/, void* /*hwnd*/) {
-  return false;
-}
-bool IsScrgb() { return false; }
-void SetMetadata(VkDevice /*dev*/, VkSwapchainKHR /*sc*/) {}
-bool PrepScratch(VkCommandBuffer /*cb*/, VkPhysicalDevice /*phys*/, VkDevice /*dev*/,
-                 VkExtent2D /*ext*/, Scratch* /*out*/) {
-  return false;
-}
-bool Record(const Frame& /*f*/) { return false; }
-void DumpPQ(const char* /*base*/, const void* /*px*/, uint32_t /*w*/, uint32_t /*h*/) {}
-
-}  // namespace snap_hdr
 
 extern "C" {
 void snap_framegen_state_loaded() {}

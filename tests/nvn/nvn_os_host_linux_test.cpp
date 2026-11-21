@@ -319,8 +319,6 @@ void test_vulkan_surface_and_upscale_stubs() {
   CHECK(!nvn::FgWanted());
   CHECK(!nvn::FgActive());
   CHECK(nvn::FgRecordGenerate(nullptr, VK_NULL_HANDLE, nullptr) == VK_NULL_HANDLE);
-  CHECK(!snap_hdr::Requested());
-  CHECK(!snap_hdr::IsScrgb());
   CHECK(!nvn::BtnIconActive());
   CHECK(!nvn::HdPhotoOn());
   CHECK(!nvn::ShotWritePng("/tmp/unused.png", nullptr, 0, 0, false));

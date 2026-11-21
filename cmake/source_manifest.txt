@@ -132,7 +132,9 @@ shared   runtime/nvn/nvn_fx.cpp
 shared   runtime/nvn/nvn_gfx.cpp
 shared   runtime/nvn/nvn_gtao.cpp
 windows  runtime/nvn/nvn_hdphoto.cpp   # #include <wincodec.h>, #include <windows.h>, CoCreateInstance ...
-windows  runtime/nvn/nvn_hdr.cpp   # #include <dxgi1_6.h>, #include <windows.h>, GetProcAddress ...
+shared   runtime/nvn/nvn_hdr.cpp   # portable Vulkan HDR10/scRGB swapchain and presentation pass
+windows  runtime/nvn/nvn_hdr_win32.cpp   # DXGI display-peak query for HDR output metadata
+linux    runtime/nvn/linux/nvn_hdr_posix.cpp   # queries SDL3 window HDR properties when available (Wayland); returns 0 on X11/SDR
 shared   runtime/nvn/nvn_hud.cpp
 shared   runtime/nvn/nvn_lens_fx.cpp
 shared   runtime/nvn/nvn_life.cpp
