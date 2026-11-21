@@ -89,7 +89,9 @@ windows  host/mods/look.cpp   # #include <windows.h>, QueryPerformanceCounter, Q
 windows  host/mods/modhooks.cpp   # #include <windows.h>
 windows  host/mods/nativeopt.cpp   # _WIN32 via audio_out.h, __declspec via audio_out.h
 windows  host/mods/neofilm.cpp   # #include <tlhelp32.h>, #include <windows.h>, BOOL ...
-windows  host/mods/photoexport.cpp   # #include <wincodec.h>, #include <windows.h>, CoCreateInstance ...
+shared   host/mods/photoexport.cpp
+windows  host/mods/photoexport_win32.cpp
+linux    host/linux/photoexport_posix.cpp
 windows  host/mods/problem_report.cpp   # #include <knownfolders.h>, #include <shlobj.h>, #include <windows.h> ...
 windows  host/mods/routes.cpp   # #include <windows.h>
 windows  host/mods/shiny.cpp   # #include <windows.h>

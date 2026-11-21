@@ -196,7 +196,8 @@ if(UNIX AND NOT APPLE)
   add_test(NAME os_current_cpu COMMAND snap_os_current_cpu_test)
 
   snap_os_test(snap_hooks_linux_test tests/platform/hooks_linux_test.cpp tests/platform/loader_test_stubs.cpp
-               host/hooks.cpp host/linux/hooks_mods_stub.cpp host/loader.cpp host/elf_check.cpp
+               host/hooks.cpp host/linux/hooks_mods_stub.cpp host/mods/photoexport.cpp host/linux/photoexport_posix.cpp
+               host/loader.cpp host/elf_check.cpp
                ${SNAP_OS_LAYER_SOURCES})
   target_include_directories(snap_hooks_linux_test PRIVATE host)
   target_compile_options(snap_hooks_linux_test PRIVATE -w)
@@ -229,6 +230,7 @@ if(UNIX AND NOT APPLE)
     snap_os_test(snap_boot_linux ${SNAP_LINUX_RUNNER_SOURCES}
                  host/linux/init_linux.cpp host/linux/hooks_mods_stub.cpp host/linux/window_sdl3.cpp
                  host/loader.cpp host/hooks.cpp host/guest_tls_hooks.cpp host/mods/drpfast.cpp host/mods/uipace.cpp
+                 host/mods/photoexport.cpp host/linux/photoexport_posix.cpp
                  host/abi_audio.cpp runtime/audio/linux/audio_sdl3.cpp runtime/hle/linux/input_backend_sdl3.cpp
                  generated/unimplemented.cpp generated/boot/nvn_bridge.cpp)
     target_compile_definitions(snap_boot_linux PRIVATE SNAP_LINUX_HAS_AOT=1)
@@ -275,6 +277,7 @@ if(UNIX AND NOT APPLE)
                host/linux/hooks_mods_stub.cpp host/linux/window_sdl3.cpp
                host/loader.cpp host/elf_check.cpp host/hooks.cpp
                host/guest_tls_hooks.cpp host/mods/drpfast.cpp host/mods/uipace.cpp
+               host/mods/photoexport.cpp host/linux/photoexport_posix.cpp
                host/abi_audio.cpp generated/unimplemented.cpp generated/boot/nvn_bridge.cpp)
   target_include_directories(snap_init_linux_test PRIVATE host)
   target_compile_options(snap_init_linux_test PRIVATE -w)
