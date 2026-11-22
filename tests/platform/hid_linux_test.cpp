@@ -293,6 +293,7 @@ static void test_input_core_and_hid_shims() {
 }
 
 static void test_aim_feel() {
+    setenv("SNAP_MOUSE_AOT_CAMERA", "0", 1);
     using namespace hle::input;
 
     // 1. Stick curves (linear identity, classic t^1.5, precise t^2.2).
@@ -362,6 +363,7 @@ static void test_aim_feel() {
     pad_fx().stick_deadzone.store(-1.0f);
     pad_fx().stick_curve.store(kCurveLinear);
     pad_fx().gyro_on.store(false);
+    unsetenv("SNAP_MOUSE_AOT_CAMERA");
 }
 
 namespace hle::input {
@@ -371,6 +373,7 @@ void route_ui(uint64_t player, const char* scene, const char* state, int event, 
 namespace nvn { extern int g_presentCount; }
 
 static void test_mouse_and_keyboard_support() {
+    setenv("SNAP_MOUSE_AOT_CAMERA", "0", 1);
     using namespace hle::input;
 
     Mapping m = Mapping::defaults();
@@ -1044,14 +1047,18 @@ static void test_mouse_and_keyboard_support() {
 
     // Clean up fake backend.
     h.set_backend(nullptr);
+    unsetenv("SNAP_MOUSE_AOT_CAMERA");
 }
 
 static void test_aot_camera_bridge() {
     using namespace hle::input;
     unsetenv("SNAP_MOUSE_AOT_CAMERA");
+    CHECK(aot_camera_enabled());
+    setenv("SNAP_MOUSE_AOT_CAMERA", "0", 1);
     CHECK(!aot_camera_enabled());
     setenv("SNAP_MOUSE_AOT_CAMERA", "1", 1);
     CHECK(aot_camera_enabled());
+    unsetenv("SNAP_MOUSE_AOT_CAMERA");
     reset_aot_mouse_delta();
 
     // 1. Suppresses mouse-to-stick in map_pad while preserving physical gamepad & WASD.

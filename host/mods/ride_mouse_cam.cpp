@@ -4,7 +4,7 @@
 // Hook site: BASE + 0x4c1688 (L_71004c1688 in main_0059.c), immediately after analog stick
 // (L_71004c13f4) and gyro integration, and immediately before the game's pitch clamp
 // (L_71004c1688..L_71004c171c) and quaternion/camera view build.
-// Off by default unless SNAP_MOUSE_AOT_CAMERA=1.
+// Enabled by default; set SNAP_MOUSE_AOT_CAMERA=0 to disable and fall back to stick-based aim.
 // Sensitivity scales via F1 menu (mouse_sensitivity, mouse_sens_x/y, invert_x/y) in Hub::poll.
 
 #include <cmath>

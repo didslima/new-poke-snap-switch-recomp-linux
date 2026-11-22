@@ -626,7 +626,7 @@ bool ui_pointer_1080(float* gx, float* gy) {
 
 static std::atomic<bool> g_sdl3_cursor_lock{false};
 static std::atomic<bool> g_sdl3_cursor_recenter{false};
-// QA26: AOT Ride camera direct mouse-look state (off unless SNAP_MOUSE_AOT_CAMERA=1).
+// AOT Ride camera direct mouse-look state (enabled by default; SNAP_MOUSE_AOT_CAMERA=0 disables).
 namespace {
 struct AotMouseCamState {
   std::mutex mu;
@@ -641,7 +641,8 @@ AotMouseCamState& aot_cam_state() {
 }  // namespace
 bool aot_camera_enabled() {
   const char* v = std::getenv("SNAP_MOUSE_AOT_CAMERA");
-  return v && std::atoi(v) != 0;
+  if (!v || !*v) return true;
+  return std::atoi(v) != 0;
 }
 void post_aot_mouse_delta(float dx, float dy, bool zoom_active) {
   AotMouseCamState& s = aot_cam_state();

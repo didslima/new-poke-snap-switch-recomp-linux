@@ -156,7 +156,7 @@ bool ui_pointer_1080(float* gx, float* gy);
 // Desired cursor mode reported by Sdl3Backend::set_cursor_mode() for the main/window thread to apply.
 void set_sdl3_cursor_mode(bool lock, bool recenter);
 void sdl3_cursor_mode(bool* lock, bool* recenter);
-// QA26 AOT Ride camera direct mouse-look bridge (active only when SNAP_MOUSE_AOT_CAMERA=1).
+// AOT Ride camera direct mouse-look bridge (enabled by default; SNAP_MOUSE_AOT_CAMERA=0 disables).
 bool aot_camera_enabled();
 void post_aot_mouse_delta(float dx, float dy, bool zoom_active);
 bool take_aot_mouse_delta(float* dx, float* dy, bool* zoom_active);
