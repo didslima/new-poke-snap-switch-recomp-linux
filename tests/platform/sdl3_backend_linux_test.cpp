@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -229,12 +230,60 @@ static void test_end_to_end_sdl3_hub_hid_integration() {
     }
 }
 
+static void test_sdl3_mouse_cursor_mode_and_raw_mouse() {
+    auto b = hle::input::make_default_backend();
+    CHECK(b != nullptr);
+    b->set_cursor_mode(true, true);
+    bool lock = false, recenter = false;
+    hle::input::sdl3_cursor_mode(&lock, &recenter);
+    CHECK(lock && recenter);
+
+    b->set_cursor_mode(true, false);
+    hle::input::sdl3_cursor_mode(&lock, &recenter);
+    CHECK(lock && !recenter);
+
+    b->set_cursor_mode(false, false);
+    hle::input::sdl3_cursor_mode(&lock, &recenter);
+    CHECK(!lock && !recenter);
+
+    // Raw mouse delta accumulation and draining.
+    float rx = 0.0f, ry = 0.0f;
+    hle::input::raw_mouse().take(&rx, &ry);
+    hle::input::post_raw_mouse(18, -12);
+    hle::input::post_raw_mouse(7, 4);
+    hle::input::raw_mouse().take(&rx, &ry);
+    CHECK(rx == 25.0f && ry == -8.0f);
+
+    // Continuous absolute cursor position posting without any button pressed, and boundary checks.
+    hle::input::post_mouse_pos(0.25f, 0.50f, true);
+    float px = 0.0f, py = 0.0f;
+    bool pin = false;
+    CHECK(hle::input::read_posted_mouse_pos(&px, &py, &pin));
+    CHECK(pin && std::fabs(px - 0.25f) < 1e-5f && std::fabs(py - 0.50f) < 1e-5f);
+
+    hle::input::post_mouse_pos(0.0f, 1.0f, true);
+    CHECK(hle::input::read_posted_mouse_pos(&px, &py, &pin));
+    CHECK(pin && px == 0.0f && py == 1.0f);
+
+    hle::input::post_mouse_pos(0.0f, 0.0f, false);
+    CHECK(hle::input::read_posted_mouse_pos(&px, &py, &pin));
+    CHECK(!pin);
+
+    // Headless poll keeps mouse fields clean when unfocused.
+    hle::input::RawInput raw;
+    b->poll(raw);
+    CHECK(!raw.focused);
+    CHECK(raw.mouse_dx == 0.0f && raw.mouse_dy == 0.0f);
+    CHECK(raw.mouse_buttons == 0);
+}
+
 int main() {
     test_backend_lifecycle_and_headless();
 #ifdef HLE_WITH_SDL3
     test_sdl3_virtual_hotplug_and_disconnect();
 #endif
     test_end_to_end_sdl3_hub_hid_integration();
+    test_sdl3_mouse_cursor_mode_and_raw_mouse();
     std::printf("sdl3_backend_linux_test: %d checks, %d failures\n", g_checks.load(), g_fail.load());
     return g_fail.load() ? 1 : 0;
 }

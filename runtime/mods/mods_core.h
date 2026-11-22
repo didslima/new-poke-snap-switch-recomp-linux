@@ -78,6 +78,9 @@ bool pack_info(const std::string& root, const std::string& id, Pack& p, std::vec
 // Unpacks <root>/<id>.zip into <root>/.unpacked/<id>/ unless that copy is current; returns the copy's folder, or "" (with
 // a warning) when the zip is damaged or holds a path that would leave the folder.
 std::string unpack_zip(const std::string& root, const std::string& id, std::vector<std::string>& warnings);
+// True when `id` is a plain name for one folder or zip directly under the mods root (no separators, no trailing dot or
+// space, no DOS device name). Every id from mods.json or the command line goes through it before touching the disk.
+bool safe_pack_id(const std::string& id);
 
 // Replacement chunk for the DRP entry worker: the original chunk's header (words, name and padding, `hdr_len` bytes)
 // followed by the raw data, stored the way the game stores uncompressed entries (csize == dsize) with the data's CRC32.

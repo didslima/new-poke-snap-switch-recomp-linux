@@ -67,6 +67,9 @@ enum SnapAudioChannelMode { SNAP_AUDIO_CH_STEREO = 0, SNAP_AUDIO_CH_AUTO = 1, SN
 // Host output: stereo (downmix if the game outputs 6), speakers (WASAPI 5.1 or 7.1), spatial (ISpatialAudioClient bed
 // for Windows Sonic or Dolby Atmos for Headphones; falls back to speakers, then stereo).
 enum SnapAudioOutputMode { SNAP_AUDIO_OUT_STEREO = 0, SNAP_AUDIO_OUT_SPEAKERS = 1, SNAP_AUDIO_OUT_SPATIAL = 2 };
+enum SnapAudioLatency { SNAP_AUDIO_LAT_LOW = 0, SNAP_AUDIO_LAT_NORMAL = 1, SNAP_AUDIO_LAT_SAFE = 2 };
+enum SnapAudioResampler { SNAP_AUDIO_RS_SYSTEM = 0, SNAP_AUDIO_RS_LINEAR = 1, SNAP_AUDIO_RS_SINC = 2 };
+enum SnapAudioRange { SNAP_AUDIO_RANGE_FULL = 0, SNAP_AUDIO_RANGE_REDUCED = 1, SNAP_AUDIO_RANGE_NIGHT = 2 };
 struct SnapAudioConfig {
   int backend;             // SnapAudioBackend; env SNAP_AUDIO_BACKEND=wasapi|sdl3|null overrides AUTO
   int channelMode;         // what GetActiveAudioDeviceChannelCountForOutput reports (and the device stream uses)
@@ -75,6 +78,10 @@ struct SnapAudioConfig {
   int enableTap;           // capture the final mix into a ring (tests)
   int outputMode;          // SnapAudioOutputMode; -1 = unset (env SNAP_AUDIO_OUTPUT, then audio.json "output", then stereo)
   int speakerChannels;     // speakers mode: 6, 8 or 0 = 8 if the device mix format has 8+ channels, else 6
+  int latencyMode;         // SnapAudioLatency, -1 = unset
+  int resampler;           // SnapAudioResampler, -1 = unset
+  int range;               // SnapAudioRange, -1 = unset
+  const char* device;      // output device selector, null or "" = default
 };
 // Volume categories (docs/audio.md, "Volume API for UI"). MASTER is applied in the host mixer; BGM/SE/VOICE are applied
 // inside Wwise by host/abi_audio.cpp (it posts the game's own Set_volume_<cat>_NN events from the Wwise sink thread).
@@ -86,6 +93,9 @@ SNAP_AUDIO_API void snap_audio_shutdown(void);
 SNAP_AUDIO_API void snap_audio_set_volume(int category, float v);
 SNAP_AUDIO_API float snap_audio_get_volume(int category);
 // Session-only mute (window focus loss): silences the final mix without touching the master volume or audio.json.
+SNAP_AUDIO_API void snap_audio_set_range(int range);
+SNAP_AUDIO_API int snap_audio_get_range(void);
+SNAP_AUDIO_API int snap_audio_list_devices(char* out, int cap);
 SNAP_AUDIO_API void snap_audio_set_muted(int muted);
 SNAP_AUDIO_API int snap_audio_get_muted(void);
 // Output mode API for the UI (docs/audio.md, "Surround and spatial output"). Persists to audio.json
@@ -117,6 +127,10 @@ struct SnapAudioStats {
   int deviceAttached;          // 0 while falling back to the timer
   int outputModeActive;        // SnapAudioOutputMode actually running
   uint32_t guestChannels;      // channels the game was told to produce
+  uint32_t streamRate;         // rate the device stream runs at
+  int latencyMode;             // SnapAudioLatency in use
+  int resampler;               // SnapAudioResampler in use
+  int range;                   // SnapAudioRange now
 };
 SNAP_AUDIO_API void snap_audio_get_stats(SnapAudioStats* s);
 SNAP_AUDIO_API void snap_audio_reset_stats(void);   // also clears the check counters and re-arms their one log line per kind

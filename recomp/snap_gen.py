@@ -204,7 +204,9 @@ MAIN_INLINE_HOOKS = {BASE + 0x5e3a58: 'rt_mod_entry',
                      BASE + 0x79a6d0: 'rt_gm_route_ui_setstate',   # entry of Player::SetState (player vtable +0x140): x0 = player, x1 = descriptor (state name at +0x18)
                      # host/mods/drpfast.cpp (perf pass 11): DRP keystream decrypt on the host; SNAP_DRP_FASTDEC=0 keeps the guest loop
                      BASE + 0x5ec9f0: 'rt_drp_decrypt',         # `cmp x28, x23` before the per-word loop of 0x5ec890: x21 = RNG state, w22 = bound
-                     BASE + 0x5eca1c: 'rt_drp_decrypt_check'}   # loop exit (SNAP_DRP_FASTDEC=check compares here)
+                     BASE + 0x5eca1c: 'rt_drp_decrypt_check',
+                     # host/mods/ride_mouse_cam.cpp (QA26): 1:1 mouse yaw/pitch injection in f_71004c0090 (L_71004c1688) before pitch clamp & quat build; no-op unless SNAP_MOUSE_AOT_CAMERA=1
+                     BASE + 0x4c1688: 'rt_gm_ride_mouse_cam'}   # loop exit (SNAP_DRP_FASTDEC=check compares here)
 # Interface pacing above 60 fps (host/mods/uipace.cpp; UI-HZ-01, INPUT-HZ-01 of analysis/perf/high-fps.md). Off unless the generator runs with
 # SNAP_GEN_UI_PACE=1 (or --ui-pace): the default output, and with it the shared build/eh/main, stays byte-identical and SNAP_RUNTIME_ABI stays 1.
 # When the shared main is regenerated with these sites, flip UI_PACE_DEFAULT and bump SNAP_RUNTIME_ABI (runtime/cpu.h) in the same change.

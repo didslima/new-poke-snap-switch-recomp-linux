@@ -545,6 +545,8 @@ struct ScalePolicy {
   float displayScale = 0.0f;                          // [upscale] > 0: window textures take this scale (the upscaler's output), not `scale`
   ScalePolicy();
   float For(const TextureBuilder& b, uint32_t tag) const;   // 1.0 when the texture is not scaled
+  bool Follows(const TextureBuilder& b, uint32_t tag) const;
+  float hd = 1.0f;                                    // HD effects (nvn_hdfx.cpp)
 };
 extern ScalePolicy g_scale;
 // [wide] ultrawide (nvn_wide.cpp, docs/ultrawide.md)
@@ -672,11 +674,20 @@ void ListRecorderGone(const void* recorder, uintptr_t ctlLo = 0, uintptr_t ctlHi
 void QueueLive(QueueImpl* q, bool live);   // InitQueue / DestroyQueue (after it finished): the queues GraveReap stamps and waits for
 enum GraveKind : uint8_t { GK_TEXTURE, GK_SAMPLER, GK_POOL, GK_TEXPOOL, GK_SAMPPOOL, GK_PROGRAM, GK_FN };
 void Retire(GraveKind k, void* obj);   // destroyed once every queue's timeline passes every submit made before this call
+// nvn_hdfx.cpp: HD effects (sea/particle layer at scene size, bloom at 2x; default Off on Linux)
+void HdfxInit();
+float HdfxFactorNow();
+bool HdfxAbFlip(int present);
+float HdfxBoost(const void* tex, const TextureBuilder& b, uint32_t tag);
+void HdfxAuditCreate(const TextureImpl* t, const uint64_t* rel, int n);
+void HdfxAuditTargets(TextureImpl* const rt[9]);
+void HdfxAuditGone(const TextureImpl* t);
 // nvn_retarget.cpp: the size rows (Internal resolution, Shadow resolution, Ultrawide, supersampling) applied with no restart
 void RetargetNote(TextureImpl* t, uint32_t tag, float boost);   // TextureInitialize: what its size was decided from
 void RetargetGone(TextureImpl* t);                              // TextureFinalize
 void RetargetAtPresent(Host* h, VkCommandBuffer cb, uint32_t scW, uint32_t scH);   // queue mutex held, the present's command buffer outside a render pass
-void RetargetAfterSubmit();                                     // after that command buffer was submitted
+void RetargetAfterSubmit();
+void RetargetSubmitFailed();                                     // after that command buffer was submitted
 void RetireVkImage(Host* h, VkImage img, VkImageView view, VkDeviceMemory mem);   // an effect module's own image: freed once the GPU is past it
 void RetireFn(std::function<void()> fn);   // the same for host-owned Vulkan objects (runs fn then)
 void GraveReap(QueueImpl* q);          // at present, under queueMutex

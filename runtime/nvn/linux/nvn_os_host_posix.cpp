@@ -24,16 +24,19 @@ __attribute__((weak)) void snap_crashlog_fatal(const char*, const char*) {}
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fcntl.h>
+#include <memory>
 #include <mutex>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -531,9 +534,307 @@ bool run_shader_harness(const std::string& cmd, const std::string& json_path) {
   return true;
 }
 
-bool run_shader_harness_server(const std::string&, const std::string&, const std::string&, const std::string&,
-                               int, uint32_t, uint32_t, bool*) {
-  return false;
+namespace {
+
+class PosixXlateServer {
+ public:
+  enum class Result { Ok, Failed, Unavailable };
+
+  explicit PosixXlateServer(std::string cmdline, int request_ms = 600000, int idle_ms = 45000)
+      : cmd_(std::move(cmdline)), request_ms_(request_ms), idle_ms_(idle_ms) {}
+
+  ~PosixXlateServer() { Stop(); }
+  PosixXlateServer(const PosixXlateServer&) = delete;
+  PosixXlateServer& operator=(const PosixXlateServer&) = delete;
+
+  Result Translate(const std::string& bin, const std::string& spv, const std::string& json, int stage, uint32_t const_off,
+                   uint32_t code_off, std::string* msg = nullptr) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (disabled_) return Result::Unavailable;
+    if (pid_ <= 0 && !StartLocked()) return Fail();
+    char tail[96];
+    std::snprintf(tail, sizeof(tail), "\t%d\t%u\t%u\n", stage, const_off, code_off);
+    const std::string req = bin + "\t" + spv + "\t" + json + tail;
+    if (!WriteAll(in_w_, req.data(), req.size())) {
+      StopLocked();
+      return Fail();
+    }
+    std::string line;
+    if (!ReadLine(&line)) {
+      StopLocked();
+      return Fail();
+    }
+    served_++;
+    last_use_ = std::chrono::steady_clock::now();
+    wake_.notify_all();
+    if (line == "ok") return Result::Ok;
+    if (msg) *msg = line.size() > 4 ? line.substr(4) : line;
+    return Result::Failed;
+  }
+
+  void Stop() {
+    std::thread t;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      StopLocked();
+      stop_idle_ = true;
+      t = std::move(idle_thread_);
+    }
+    wake_.notify_all();
+    if (t.joinable()) t.join();
+  }
+
+ private:
+  Result Fail() {
+    failures_++;
+    if (served_ == 0 || failures_ >= 5) disabled_ = true;
+    return Result::Unavailable;
+  }
+
+  static bool WriteAll(int fd, const char* data, size_t len) {
+    sigset_t block_pipe, old_mask;
+    sigemptyset(&block_pipe);
+    sigaddset(&block_pipe, SIGPIPE);
+    const bool masked = (::pthread_sigmask(SIG_BLOCK, &block_pipe, &old_mask) == 0);
+    const bool had_pipe = masked && sigismember(&old_mask, SIGPIPE);
+    size_t off = 0;
+    bool ok = true;
+    while (off < len) {
+      const ssize_t n = ::write(fd, data + off, len - off);
+      if (n > 0) {
+        off += static_cast<size_t>(n);
+      } else if (n < 0 && errno == EINTR) {
+        continue;
+      } else {
+        ok = false;
+        break;
+      }
+    }
+    if (masked) {
+      if (!ok && errno == EPIPE && !had_pipe) {
+        struct timespec zero{0, 0};
+        ::sigtimedwait(&block_pipe, nullptr, &zero);
+      }
+      ::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
+    }
+    return ok;
+  }
+
+  bool ReadLine(std::string* out) {
+    out->clear();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(request_ms_);
+    for (;;) {
+      const size_t nl = pending_.find('\n');
+      if (nl != std::string::npos) {
+        *out = pending_.substr(0, nl);
+        if (!out->empty() && out->back() == '\r') out->pop_back();
+        pending_.erase(0, nl + 1);
+        return true;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) return false;
+      const int rem_ms = static_cast<int>(
+          std::min<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count(), 60000));
+      struct pollfd pfd{out_r_, POLLIN, 0};
+      const int pr = ::poll(&pfd, 1, std::max(rem_ms, 1));
+      if (pr < 0) {
+        if (errno == EINTR) continue;
+        return false;
+      }
+      if (pr == 0) continue;
+      char buf[4096];
+      const ssize_t r = ::read(out_r_, buf, sizeof(buf));
+      if (r > 0) {
+        pending_.append(buf, static_cast<size_t>(r));
+      } else if (r == 0) {
+        return false;
+      } else if (errno != EINTR) {
+        return false;
+      }
+    }
+  }
+
+  bool StartLocked() {
+    std::vector<std::string> argv_storage;
+    if (!parse_command_argv(cmd_, argv_storage)) return false;
+    if (argv_storage[0] == "dotnet" && argv_storage.size() > 1) {
+      struct stat st_dll {};
+      if (::stat(argv_storage[1].c_str(), &st_dll) != 0 || !S_ISREG(st_dll.st_mode)) return false;
+    }
+
+    int in_fds[2] = {-1, -1};
+    int out_fds[2] = {-1, -1};
+    if (::pipe(in_fds) != 0) return false;
+    if (::pipe(out_fds) != 0) {
+      ::close(in_fds[0]);
+      ::close(in_fds[1]);
+      return false;
+    }
+    ::fcntl(in_fds[1], F_SETFD, FD_CLOEXEC);
+    ::fcntl(out_fds[0], F_SETFD, FD_CLOEXEC);
+
+    std::vector<char*> c_argv;
+    c_argv.reserve(argv_storage.size() + 1);
+    for (std::string& s : argv_storage) c_argv.push_back(s.data());
+    c_argv.push_back(nullptr);
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+      ::close(in_fds[0]);
+      ::close(in_fds[1]);
+      ::close(out_fds[0]);
+      ::close(out_fds[1]);
+      return false;
+    }
+    if (pid == 0) {
+      ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+      ::dup2(in_fds[0], STDIN_FILENO);
+      ::dup2(out_fds[1], STDOUT_FILENO);
+      const int devnull = ::open("/dev/null", O_WRONLY);
+      if (devnull >= 0) {
+        ::dup2(devnull, STDERR_FILENO);
+        if (devnull > STDERR_FILENO) ::close(devnull);
+      }
+      ::close(in_fds[0]);
+      ::close(in_fds[1]);
+      ::close(out_fds[0]);
+      ::close(out_fds[1]);
+      ::execvp(c_argv[0], c_argv.data());
+      _exit(127);
+    }
+
+    ::close(in_fds[0]);
+    ::close(out_fds[1]);
+    pid_ = pid;
+    in_w_ = in_fds[1];
+    out_r_ = out_fds[0];
+    pending_.clear();
+    last_use_ = std::chrono::steady_clock::now();
+    if (!idle_thread_.joinable() && !stop_idle_ && idle_ms_ > 0) {
+      idle_thread_ = std::thread([this] { IdleLoop(); });
+    }
+    return true;
+  }
+
+  void StopLocked() {
+    if (in_w_ >= 0) {
+      ::close(in_w_);
+      in_w_ = -1;
+    }
+    if (out_r_ >= 0) {
+      ::close(out_r_);
+      out_r_ = -1;
+    }
+    if (pid_ > 0) {
+      auto wait_exit = [&](int max_ms) -> bool {
+        for (int elapsed = 0; elapsed < max_ms; elapsed += 10) {
+          int st = 0;
+          const pid_t r = ::waitpid(pid_, &st, WNOHANG);
+          if (r == pid_ || (r < 0 && errno == ECHILD)) return true;
+          struct timespec ts{0, 10 * 1000 * 1000};
+          ::nanosleep(&ts, nullptr);
+        }
+        return false;
+      };
+      if (!wait_exit(500)) {
+        ::kill(pid_, SIGTERM);
+        if (!wait_exit(500)) {
+          ::kill(pid_, SIGKILL);
+          int st = 0;
+          while (::waitpid(pid_, &st, 0) < 0 && errno == EINTR) {}
+        }
+      }
+      pid_ = -1;
+    }
+    pending_.clear();
+  }
+
+  void IdleLoop() {
+    std::unique_lock<std::mutex> lk(mu_);
+    while (!stop_idle_) {
+      if (pid_ <= 0) {
+        wake_.wait(lk);
+        continue;
+      }
+      const auto idle_for = std::chrono::steady_clock::now() - last_use_;
+      const auto limit = std::chrono::milliseconds(idle_ms_);
+      if (idle_for >= limit) {
+        StopLocked();
+        continue;
+      }
+      wake_.wait_for(lk, limit - idle_for);
+    }
+  }
+
+  std::string cmd_;
+  int request_ms_;
+  int idle_ms_;
+  std::mutex mu_;
+  std::condition_variable wake_;
+  pid_t pid_ = -1;
+  int in_w_ = -1;
+  int out_r_ = -1;
+  std::string pending_;
+  std::chrono::steady_clock::time_point last_use_{};
+  std::thread idle_thread_;
+  bool stop_idle_ = false;
+  bool disabled_ = false;
+  int failures_ = 0;
+  uint64_t served_ = 0;
+};
+
+struct ServerSlot {
+  std::mutex mu;
+  std::string launch;
+  std::unique_ptr<PosixXlateServer> srv;
+};
+
+ServerSlot& server_slot() {
+  static ServerSlot slot;
+  return slot;
+}
+
+void shutdown_xlate_server_atexit() {
+  ServerSlot& slot = server_slot();
+  std::lock_guard<std::mutex> lk(slot.mu);
+  if (slot.srv) slot.srv->Stop();
+}
+
+}  // namespace
+
+bool run_shader_harness_server(const std::string& launch, const std::string& bin, const std::string& spv, const std::string& json,
+                               int stage, uint32_t const_off, uint32_t code_off, bool* out_ok) {
+  if (out_ok) *out_ok = false;
+  if (launch.empty() || bin.empty() || spv.empty() || json.empty()) return false;
+  if (const char* e = std::getenv("SNAP_XLATE_SERVER"); e && e[0] == '0' && e[1] == '\0') return false;
+
+  PosixXlateServer* srv = nullptr;
+  {
+    ServerSlot& slot = server_slot();
+    std::lock_guard<std::mutex> lk(slot.mu);
+    static std::once_flag reg_atexit;
+    std::call_once(reg_atexit, []() { std::atexit(shutdown_xlate_server_atexit); });
+    if (!slot.srv || slot.launch != launch) {
+      slot.launch = launch;
+      slot.srv = std::make_unique<PosixXlateServer>(launch + " --nvn-serve", harness_timeout_ms());
+    }
+    srv = slot.srv.get();
+  }
+
+  std::string msg;
+  const auto r = srv->Translate(bin, spv, json, stage, const_off, code_off, &msg);
+  if (r == PosixXlateServer::Result::Unavailable) return false;
+  if (r == PosixXlateServer::Result::Failed) {
+    std::fprintf(stderr, "[nvn][harness-server] shader rejected: %s\n", msg.c_str());
+    return true;
+  }
+  struct stat st_out {};
+  if (::stat(json.c_str(), &st_out) != 0 || !S_ISREG(st_out.st_mode) || st_out.st_size <= 0) {
+    std::fprintf(stderr, "[nvn][harness-server] missing or empty output artifact: %s\n", json.c_str());
+    return true;
+  }
+  if (out_ok) *out_ok = true;
+  return true;
 }
 
 std::string resolve_shader_cache_key(const std::string&, std::string (*sha_fn)(void*, const std::string&), void* sha_ctx,

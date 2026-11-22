@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -169,6 +170,11 @@ struct OpenDir {
 
 constexpr const char* kPointerName = "CURRENT";
 
+// The changes a commit writes: files changed, paths deleted and directories created since the last commit.
+struct Pending {
+  std::set<std::string> dirty, deleted, dirs;
+};
+
 // The save mount: committed generations on disk plus a working directory for the uncommitted changes.
 //   <root>/gens/<n>/      complete state of generation n (immutable once committed)
 //   <root>/gens/<n>.ok    written after generation n is complete
@@ -182,6 +188,21 @@ struct Save {
   std::set<std::string> dirty, deleted, dirs;  // dirs: directories created since the last commit
   std::string work_name = "working";           // "working", or "working.<k>" when an old one could not be removed
   std::set<uint64_t> orphans;                  // complete but never published (marker stuck after a failed commit)
+  // Fs::commit builds the generation without the fs lock (from a copy of the pending sets). Changes made meanwhile go to the live
+  // sets and to the journal; a published commit makes the journal the new pending sets, a failed one drops it (the live sets
+  // still hold everything). The journal marks every removed path deleted: the generation being built may hold it.
+  bool committing = false;
+  Pending journal;
+  void add_dirty(const std::string& r) { dirty.insert(r); if (committing) journal.dirty.insert(r); }
+  void drop_dirty(const std::string& r) { dirty.erase(r); if (committing) journal.dirty.erase(r); }
+  void add_dir(const std::string& r) { dirs.insert(r); if (committing) journal.dirs.insert(r); }
+  void drop_dir(const std::string& r) { dirs.erase(r); if (committing) journal.dirs.erase(r); }
+  void undelete(const std::string& r) { deleted.erase(r); if (committing) journal.deleted.erase(r); }
+  void mark_deleted(const std::string& r) {   // a removed path counts as deleted when the committed generation has it
+    std::error_code ec;
+    if (stdfs::exists(committed() / to_path(r), ec)) deleted.insert(r);
+    if (committing) journal.deleted.insert(r);
+  }
 
   stdfs::path gens() const { return root / "gens"; }
   stdfs::path gen_dir(uint64_t n) const { return gens() / std::to_string(n); }
@@ -333,7 +354,7 @@ struct Save {
         if (ec) return false;
       }
     }
-    dirty.insert(rel);
+    add_dirty(rel);
     *out = w;
     return true;
   }
@@ -364,7 +385,10 @@ struct Save {
 
   // Copies (hard-links where possible) every unchanged file of the committed generation into the new one. Any failure is returned:
   // a generation missing a carried file must never be published.
-  bool carry(const stdfs::path& from, const stdfs::path& to, const std::string& rel, std::error_code& why) {
+  bool carry(const stdfs::path& from, const stdfs::path& to, const std::string& rel, std::error_code& why, const Pending& pd) {
+    const auto& dirty = pd.dirty;
+    const auto& deleted = pd.deleted;
+    const auto& dirs = pd.dirs;
     std::error_code ec;
     stdfs::directory_iterator it(from, ec);
     if (ec) { why = ec; return false; }
@@ -387,7 +411,7 @@ struct Save {
       if (isdir) {
         stdfs::create_directories(to / name, e2);
         if (e2) { why = e2; return false; }
-        if (!carry(e.path(), to / name, child, why)) return false;
+        if (!carry(e.path(), to / name, child, why, pd)) return false;
       } else if (!dirty.count(child)) {
         // `to` is a directory this commit created itself, so the name is new; copy_options::none refuses an existing entry
         // instead of writing through it (an existing entry could be a hard link into a committed generation).
@@ -424,7 +448,8 @@ struct Save {
     return false;
   }
 
-  uint32_t do_commit(const std::function<void(const char*)>& hook) {
+  template <class PublishFn>
+  uint32_t do_commit(const std::function<void(const char*)>& hook, const Pending& pd, PublishFn&& publish) {
     auto stage = [&](const char* s) { if (hook) hook(s); };
     std::error_code ec;
     stage("commit:begin");
@@ -442,9 +467,9 @@ struct Save {
       if (!drop_generation(n)) log("fs: save: the failed generation %llu could not be fully removed; the next commit uses a new number", (unsigned long long)n);
       return rc;
     };
-    if (!carry(committed(), ng, "", ec)) return fail(ec, "carry");
+    if (!carry(committed(), ng, "", ec, pd)) return fail(ec, "carry");
     stage("commit:carried");
-    for (const std::string& rel : dirty) {
+    for (const std::string& rel : pd.dirty) {
       stdfs::path src = working() / to_path(rel), dst = ng / to_path(rel);
       const bool have = stdfs::exists(src, ec);
       if (ec) return fail(ec, "file status");   // unknown is not "deleted": never drop a file on an I/O error
@@ -459,7 +484,7 @@ struct Save {
       if (!flush_path(dst, &ec)) return fail(ec, "file flush");   // the previous generation stays current
       stage("commit:file");
     }
-    for (const std::string& rel : dirs) {
+    for (const std::string& rel : pd.dirs) {
       stdfs::create_directories(ng / to_path(rel), ec);
       if (ec) return fail(ec, "directory");
     }
@@ -475,8 +500,7 @@ struct Save {
     std::error_code pe;
     if (!write_pointer(n, hook, &pe)) return fail(pe ? pe : last_os_error(), "pointer");
     orphans.erase(n);
-    cur = n;
-    dirty.clear(); deleted.clear(); dirs.clear();
+    publish(n);
     // automatic backups: keep the current generation and the `keep` newest complete ones before it (numbers can have gaps
     // where a stale leftover was skipped); everything else below the current one goes, leftovers included
     if (keep >= 0) {
@@ -501,7 +525,19 @@ struct Mount {
 
 // ---------------------------------------------------------------------------------------------------------------
 struct Fs::Impl {
+  // Lock order, and the virtual-core rule that keeps it deadlock free:
+  //  1. commit_mu, then mu. Never take commit_mu while holding mu.
+  //  2. of->mu (an open file's write lock), then mu. A thread holding mu never takes of->mu.
+  //  3. Never take a virtual core back (os_io_end) while holding commit_mu, mu or of->mu. Most callers wait for mu while holding
+  //     their core, so a mu holder that waits for a core can wait forever once every core is held by a thread queued on mu.
+  //     Waiting for a lock with the core released is fine: os_io_begin, lock, work, unlock, then os_io_end (get_file,
+  //     PathOpLock, commit).
   std::mutex mu;  // mounts and tables
+  // Serializes commits, restores, save mounts and unmounts. Taken before mu, never while holding it. A commit holds it for the
+  // whole disk work and mu only to copy and publish the pending sets. Path-changing operations on a save mount wait for it
+  // while that mount commits (PathOpLock): the commit reads working/ by name, so only data reads and writes (and opens,
+  // which add to the commit's journal) run alongside it.
+  std::mutex commit_mu;
   std::map<std::string, std::shared_ptr<Mount>> mounts;
   std::unordered_map<uint64_t, std::shared_ptr<OpenFile>> files;
   std::unordered_map<uint64_t, std::shared_ptr<OpenDir>> dirs;
@@ -596,6 +632,7 @@ uint32_t Fs::mount_host(const std::string& name, const std::string& dir, bool wr
 }
 
 uint32_t Fs::mount_save(const std::string& name, const uint64_t uid[2]) {
+  std::lock_guard<std::mutex> cg(p_->commit_mu);
   std::lock_guard<std::mutex> g(p_->mu);
   auto m = std::make_shared<Mount>();
   m->kind = Mount::SaveData;
@@ -639,6 +676,7 @@ uint32_t Fs::mount_save(const std::string& name, const uint64_t uid[2]) {
 }
 
 uint32_t Fs::unmount(const std::string& name) {
+  std::lock_guard<std::mutex> cg(p_->commit_mu);
   std::lock_guard<std::mutex> g(p_->mu);
   auto it = p_->mounts.find(name);
   if (it == p_->mounts.end()) return kResultNotMounted;
@@ -663,6 +701,34 @@ struct Resolved {
   std::string rel;
   stdfs::path host;  // for layered mounts: first layer holding rel (or the first layer if none)
   int kind = 0;      // 0 none, 1 dir, 2 file
+};
+}  // namespace
+
+// Lock for a path-changing operation (create, delete, rename, directory create and delete). Holds mu. The commit builds the new
+// generation outside mu and copies its dirty files from working/ by name, so a delete or rename on the mount it is committing
+// could publish a generation without the file, or fail the commit. retry(m) is called right before the change: when m is a save
+// mount with a commit running it drops mu, gives up the virtual core, waits for commit_mu (the commit has ended), takes mu
+// again and returns true; the caller then resolves its paths again. The core comes back only after both locks are released.
+namespace {
+struct PathOpLock {
+  bool io = false;
+  std::unique_lock<std::mutex> cg, g;
+  explicit PathOpLock(Fs::Impl* p) : cg(p->commit_mu, std::defer_lock), g(p->mu) {}
+  PathOpLock(const PathOpLock&) = delete;
+  PathOpLock& operator=(const PathOpLock&) = delete;
+  bool retry(const std::shared_ptr<Mount>& m) {
+    if (!m || !m->save || !m->save->committing || cg.owns_lock()) return false;
+    g.unlock();
+    if (!io) { os_io_begin(); io = true; }
+    cg.lock();   // commit_mu before mu (rule 1); no commit can start while it is held, so an operation retries once at most
+    g.lock();
+    return true;
+  }
+  ~PathOpLock() {
+    if (g.owns_lock()) g.unlock();
+    if (cg.owns_lock()) cg.unlock();
+    if (io) os_io_end();   // rule 3: after both locks are released
+  }
 };
 }  // namespace
 
@@ -761,9 +827,20 @@ void Fs::state_load(int* closed, int* reopened) {
 }
 
 static std::shared_ptr<OpenFile> get_file(Fs::Impl* p, FileId f) {
-  std::lock_guard<std::mutex> g(p->mu);
+  // Contended (another thread is in a path lookup or a directory operation): wait without the virtual core, like a Horizon IPC wait.
+  // The core comes back only after mu is released (lock-order rule 3 at Fs::Impl).
+  std::unique_lock<std::mutex> g(p->mu, std::try_to_lock);
+  if (g.owns_lock()) {
+    auto it = p->files.find(f);
+    return it == p->files.end() ? nullptr : it->second;
+  }
+  os_io_begin();
+  g.lock();
   auto it = p->files.find(f);
-  return it == p->files.end() ? nullptr : it->second;
+  std::shared_ptr<OpenFile> of = it == p->files.end() ? nullptr : it->second;
+  g.unlock();
+  os_io_end();
+  return of;
 }
 
 uint32_t Fs::read_file(FileId f, int64_t off, void* buf, size_t n, size_t* out) {
@@ -796,7 +873,7 @@ uint32_t Fs::read_file(FileId f, int64_t off, void* buf, size_t n, size_t* out) 
 static void mark_dirty(Fs::Impl* p, OpenFile& of) {
   if (!of.save) return;
   std::lock_guard<std::mutex> g(p->mu);
-  of.save->dirty.insert(of.rel);
+  of.save->add_dirty(of.rel);
 }
 
 uint32_t Fs::write_file(FileId f, int64_t off, const void* buf, size_t n, bool flush) {
@@ -863,20 +940,24 @@ uint32_t Fs::get_entry_type(int* out, const std::string& path) {
 }
 
 uint32_t Fs::create_file(const std::string& path, int64_t size) {
-  std::lock_guard<std::mutex> g(p_->mu);
+  PathOpLock L(p_.get());
   Resolved r;
-  uint32_t rc = resolve(p_.get(), path, &r);
-  if (rc) return rc;
-  if (!r.m->writable) return kResultWriteNotPermitted;
-  if (r.rel.empty()) return kResultInvalidArgument;
-  if (r.kind != 0) return kResultPathAlreadyExists;
+  for (;;) {
+    r = Resolved{};
+    uint32_t rc = resolve(p_.get(), path, &r);
+    if (rc) return rc;
+    if (!r.m->writable) return kResultWriteNotPermitted;
+    if (r.rel.empty()) return kResultInvalidArgument;
+    if (r.kind != 0) return kResultPathAlreadyExists;
+    if (!L.retry(r.m)) break;
+  }
   std::error_code ec;
   stdfs::path host;
   if (r.m->kind == Mount::SaveData) {
     std::string parent = r.rel.find('/') == std::string::npos ? "" : r.rel.substr(0, r.rel.rfind('/'));
     if (r.m->save->kind(parent) != 1) return kResultPathNotFound;
-    r.m->save->deleted.erase(r.rel);
-    r.m->save->dirty.insert(r.rel);
+    r.m->save->undelete(r.rel);
+    r.m->save->add_dirty(r.rel);
     host = r.m->save->working() / to_path(r.rel);
     stdfs::create_directories(host.parent_path(), ec);
   } else {
@@ -896,18 +977,22 @@ uint32_t Fs::create_file(const std::string& path, int64_t size) {
 }
 
 uint32_t Fs::delete_file(const std::string& path) {
-  std::lock_guard<std::mutex> g(p_->mu);
+  PathOpLock L(p_.get());
   Resolved r;
-  uint32_t rc = resolve(p_.get(), path, &r);
-  if (rc) return rc;
-  if (!r.m->writable) return kResultWriteNotPermitted;
-  if (r.kind != 2) return kResultPathNotFound;
+  for (;;) {
+    r = Resolved{};
+    uint32_t rc = resolve(p_.get(), path, &r);
+    if (rc) return rc;
+    if (!r.m->writable) return kResultWriteNotPermitted;
+    if (r.kind != 2) return kResultPathNotFound;
+    if (!L.retry(r.m)) break;
+  }
   std::error_code ec;
   if (r.m->kind == Mount::SaveData) {
     Save& s = *r.m->save;
     stdfs::remove(s.working() / to_path(r.rel), ec);
-    s.dirty.erase(r.rel);
-    if (stdfs::exists(s.committed() / to_path(r.rel), ec)) s.deleted.insert(r.rel);
+    s.drop_dirty(r.rel);
+    s.mark_deleted(r.rel);
   } else {
     stdfs::remove(r.m->layers[0] / to_path(r.rel), ec);
     if (ec) return kResultTargetLocked;
@@ -916,12 +1001,16 @@ uint32_t Fs::delete_file(const std::string& path) {
 }
 
 uint32_t Fs::create_directory(const std::string& path) {
-  std::lock_guard<std::mutex> g(p_->mu);
+  PathOpLock L(p_.get());
   Resolved r;
-  uint32_t rc = resolve(p_.get(), path, &r);
-  if (rc) return rc;
-  if (!r.m->writable) return kResultWriteNotPermitted;
-  if (r.kind != 0) return kResultPathAlreadyExists;
+  for (;;) {
+    r = Resolved{};
+    uint32_t rc = resolve(p_.get(), path, &r);
+    if (rc) return rc;
+    if (!r.m->writable) return kResultWriteNotPermitted;
+    if (r.kind != 0) return kResultPathAlreadyExists;
+    if (!L.retry(r.m)) break;
+  }
   std::error_code ec;
   if (r.m->kind == Mount::SaveData) {
     Save& s = *r.m->save;
@@ -931,8 +1020,8 @@ uint32_t Fs::create_directory(const std::string& path) {
     if (ec) return kResultTargetLocked;
     // un-deleting the path is fine even if a committed *file* had this name: carry() sees the type change (working/ holds a
     // directory, dirs lists it) and does not carry the old file
-    s.deleted.erase(r.rel);
-    s.dirs.insert(r.rel);
+    s.undelete(r.rel);
+    s.add_dir(r.rel);
   } else {
     stdfs::path h = r.m->layers[0] / to_path(r.rel);
     if (!stdfs::is_directory(h.parent_path(), ec)) return kResultPathNotFound;
@@ -943,12 +1032,16 @@ uint32_t Fs::create_directory(const std::string& path) {
 }
 
 uint32_t Fs::delete_directory(const std::string& path, bool recursive) {
-  std::unique_lock<std::mutex> g(p_->mu);
+  PathOpLock L(p_.get());
   Resolved r;
-  uint32_t rc = resolve(p_.get(), path, &r);
-  if (rc) return rc;
-  if (!r.m->writable) return kResultWriteNotPermitted;
-  if (r.kind != 1 || r.rel.empty()) return kResultPathNotFound;
+  for (;;) {
+    r = Resolved{};
+    uint32_t rc = resolve(p_.get(), path, &r);
+    if (rc) return rc;
+    if (!r.m->writable) return kResultWriteNotPermitted;
+    if (r.kind != 1 || r.rel.empty()) return kResultPathNotFound;
+    if (!L.retry(r.m)) break;
+  }
   std::error_code ec;
   if (r.m->kind == Mount::SaveData) {
     Save& s = *r.m->save;
@@ -959,13 +1052,13 @@ uint32_t Fs::delete_directory(const std::string& path, bool recursive) {
         if (e.type == kDirectory) { uint32_t x = rm(child); if (x) return x; }
         else {
           stdfs::remove(s.working() / to_path(child), ec);
-          s.dirty.erase(child);
-          if (stdfs::exists(s.committed() / to_path(child), ec)) s.deleted.insert(child);
+          s.drop_dirty(child);
+          s.mark_deleted(child);
         }
       }
       stdfs::remove(s.working() / to_path(rel), ec);
-      s.dirs.erase(rel);
-      if (stdfs::exists(s.committed() / to_path(rel), ec)) s.deleted.insert(rel);
+      s.drop_dir(rel);
+      s.mark_deleted(rel);
       return kSuccess;
     };
     return rm(r.rel);
@@ -980,16 +1073,21 @@ uint32_t Fs::delete_directory(const std::string& path, bool recursive) {
 }
 
 uint32_t Fs::rename_file(const std::string& from, const std::string& to) {
-  std::lock_guard<std::mutex> g(p_->mu);
+  PathOpLock L(p_.get());
   Resolved a, b;
-  uint32_t rc = resolve(p_.get(), from, &a);
-  if (rc) return rc;
-  rc = resolve(p_.get(), to, &b);
-  if (rc) return rc;
-  if (a.m != b.m) return kResultInvalidArgument;
-  if (!a.m->writable) return kResultWriteNotPermitted;
-  if (a.kind != 2) return kResultPathNotFound;
-  if (b.kind != 0) return kResultPathAlreadyExists;
+  for (;;) {
+    a = Resolved{};
+    b = Resolved{};
+    uint32_t rc = resolve(p_.get(), from, &a);
+    if (rc) return rc;
+    rc = resolve(p_.get(), to, &b);
+    if (rc) return rc;
+    if (a.m != b.m) return kResultInvalidArgument;
+    if (!a.m->writable) return kResultWriteNotPermitted;
+    if (a.kind != 2) return kResultPathNotFound;
+    if (b.kind != 0) return kResultPathAlreadyExists;
+    if (!L.retry(a.m)) break;
+  }
   std::error_code ec;
   const std::string to_parent = b.rel.find('/') == std::string::npos ? "" : b.rel.substr(0, b.rel.rfind('/'));
   if (a.m->kind == Mount::SaveData) {
@@ -1001,10 +1099,10 @@ uint32_t Fs::rename_file(const std::string& from, const std::string& to) {
     stdfs::create_directories(dst.parent_path(), ec);
     stdfs::rename(src, dst, ec);
     if (ec) return kResultTargetLocked;
-    s.dirty.erase(a.rel);
-    if (stdfs::exists(s.committed() / to_path(a.rel), ec)) s.deleted.insert(a.rel);
-    s.deleted.erase(b.rel);
-    s.dirty.insert(b.rel);
+    s.drop_dirty(a.rel);
+    s.mark_deleted(a.rel);
+    s.undelete(b.rel);
+    s.add_dirty(b.rel);
   } else {
     if (!stdfs::is_directory(a.m->layers[0] / to_path(to_parent), ec)) return kResultPathNotFound;
     stdfs::rename(a.m->layers[0] / to_path(a.rel), a.m->layers[0] / to_path(b.rel), ec);
@@ -1078,12 +1176,43 @@ uint32_t Fs::close_directory(DirId d) {
 }
 
 uint32_t Fs::commit(const std::string& mount) {
+  static const bool locked = [] { const char* e = std::getenv("SNAP_FS_COMMIT_LOCKED"); return e && *e == '1'; }();
+  const auto t0 = std::chrono::steady_clock::now();
+  struct IoCoreGuard {
+    bool active = false;
+    std::unique_lock<std::mutex> cg;
+    explicit IoCoreGuard(std::mutex& cm, bool unlock_mu) : active(unlock_mu), cg(cm, std::defer_lock) {
+      if (active) os_io_begin();   // rule 3: give up virtual core before blocking on commit_mu
+      cg.lock();
+    }
+    ~IoCoreGuard() {
+      if (cg.owns_lock()) cg.unlock();
+      if (active) os_io_end();     // rule 3: take virtual core back only after commit_mu and mu are released
+    }
+  } io_guard(p_->commit_mu, !locked);
+
   std::vector<std::shared_ptr<OpenFile>> to_flush;
   std::unique_lock<std::mutex> g(p_->mu);
   auto m = p_->find_mount(mount);
   if (!m) return kResultNotMounted;
   if (m->kind != Mount::SaveData) return kSuccess;  // nothing to commit on other mounts
+  Save& s = *m->save;
   for (auto& kv : p_->files) if (kv.second->mount == mount && kv.second->writable) to_flush.push_back(kv.second);
+  const Pending pd{s.dirty, s.deleted, s.dirs};
+  auto hook = p_->hook;
+  s.journal = Pending{};
+  s.committing = !locked;
+  struct EndJournal {   // a failed (or thrown-through) commit drops the journal; the live sets still hold every change
+    Fs::Impl* p; Save& s; bool unlocked;
+    ~EndJournal() {
+      if (!s.committing) return;
+      std::unique_lock<std::mutex> l(p->mu, std::defer_lock);
+      if (unlocked) l.lock();
+      s.committing = false;
+      s.journal = Pending{};
+    }
+  } end_journal{p_.get(), s, !locked};
+  if (!locked) g.unlock();
   for (auto& f : to_flush) {   // no of->mu here (lock order: of->mu, then p->mu); FlushFileBuffers on a shared handle is safe
     if (!f->hf.flush()) {
       const std::error_code e = last_os_error();
@@ -1091,19 +1220,37 @@ uint32_t Fs::commit(const std::string& mount) {
       return commit_result(e);   // nothing was committed: CURRENT and the dirty set are as they were, so a retry carries everything
     }
   }
-  auto hook = p_->hook;
-  const auto t0 = std::chrono::steady_clock::now();
-  uint32_t rc = m->save->do_commit(hook);
+  uint32_t rc = s.do_commit(hook, pd, [&](uint64_t n) {
+    std::unique_lock<std::mutex> l(p_->mu, std::defer_lock);
+    if (!locked) l.lock();
+    s.cur = n;
+    if (s.committing) {   // changes made during the commit are the next commit's work
+      s.dirty = std::move(s.journal.dirty); s.deleted = std::move(s.journal.deleted); s.dirs = std::move(s.journal.dirs);
+      s.committing = false;
+      s.journal = Pending{};
+    } else {
+      s.dirty.clear(); s.deleted.clear(); s.dirs.clear();
+    }
+  });
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   // always logged (a handful per session): how long the disk kept the game waiting is part of a "the game froze when it saved" report
-  log("fs: commit %s -> generation %llu in %.1f ms (result %#x)", mount.c_str(), (unsigned long long)m->save->cur,
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), rc);
+  log("fs: commit %s -> generation %llu in %.1f ms (result %#x)", mount.c_str(), (unsigned long long)s.cur, ms, rc);
+  if (snap_perf::on) {
+    char det[96];
+    snprintf(det, sizeof det, "%s gen=%llu files=%zu rc=%#x", mount.c_str(), (unsigned long long)s.cur, pd.dirty.size(), rc);
+    snap_perf::event("fs_commit", ms, det);
+  }
   return rc;
 }
 
 bool Fs::drain_for_exit(int ms) {
   const uint64_t end = hle::host::monotonic_ms() + static_cast<uint64_t>(ms > 0 ? ms : 0);
-  while (!p_->mu.try_lock()) {
+  while (!p_->commit_mu.try_lock()) {   // a commit runs mostly outside mu now: wait for it first (both stay held until exit)
     if (hle::host::monotonic_ms() >= end) return false;
+    hle::host::sleep_ms(5);
+  }
+  while (!p_->mu.try_lock()) {
+    if (hle::host::monotonic_ms() >= end) { p_->commit_mu.unlock(); return false; }
     hle::host::sleep_ms(5);
   }
   return true;
@@ -1123,6 +1270,7 @@ uint32_t Fs::get_free_space(int64_t* out, const std::string& mount) {
 }
 
 std::vector<SaveGeneration> Fs::list_generations(const std::string& mount) {
+  std::lock_guard<std::mutex> cg(p_->commit_mu);   // a running commit changes the generation folders and orphans
   std::lock_guard<std::mutex> g(p_->mu);
   std::vector<SaveGeneration> v;
   auto m = p_->find_mount(mount);
@@ -1134,6 +1282,7 @@ std::vector<SaveGeneration> Fs::list_generations(const std::string& mount) {
 }
 
 uint32_t Fs::restore_generation(const std::string& mount, uint64_t gen) {
+  std::lock_guard<std::mutex> cg(p_->commit_mu);
   std::lock_guard<std::mutex> g(p_->mu);
   auto m = p_->find_mount(mount);
   if (!m || m->kind != Mount::SaveData) return kResultNotMounted;
@@ -1199,7 +1348,11 @@ uint32_t Fs::restore_generation(const std::string& mount, uint64_t gen) {
   std::set<std::string> old_dirty = std::move(s.dirty), old_deleted = std::move(s.deleted), old_dirs = std::move(s.dirs);
   s.work_name = stage_name;
   s.dirty = std::move(dirty); s.deleted = std::move(deleted); s.dirs = std::move(dirs);
-  uint32_t rc = s.do_commit(p_->hook);
+  const Pending pd{s.dirty, s.deleted, s.dirs};
+  uint32_t rc = s.do_commit(p_->hook, pd, [&](uint64_t n) {   // mu is held for the whole restore
+    s.cur = n;
+    s.dirty.clear(); s.deleted.clear(); s.dirs.clear();
+  });
   if (rc != kSuccess) {
     s.work_name = old_name;
     s.dirty = std::move(old_dirty); s.deleted = std::move(old_deleted); s.dirs = std::move(old_dirs);

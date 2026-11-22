@@ -432,7 +432,8 @@ static void ui_present_impl(const SnapUiFrame* f) {
     std::lock_guard<std::recursive_mutex> lk(g.mu);
     const hle::access::State& acc = hle::access::state();
     set_high_contrast(acc.contrast != 0);
-    const float scale = std::clamp(hubr.mapping().ui_scale, 0.5f, 3.0f) * std::clamp(acc.ui_size, 100, 200) / 100.0f * std::max(0.75f, size.y / 1080.0f);
+    float scale = std::clamp(hubr.mapping().ui_scale, 0.5f, 3.0f) * std::clamp(acc.ui_size, 100, 200) / 100.0f * std::max(0.75f, size.y / 1080.0f);
+    scale = std::clamp(scale, 0.5f, std::max(0.5f, std::min(size.x / 960.0f, size.y / 540.0f)));
     if (std::fabs(scale - g.applied_scale) > 0.001f) apply_style(scale);
     ensure_fallback_fonts(g_base_game_font);   // the menu language can change while the game runs (Game language row)
     ImGui_ImplVulkan_NewFrame();

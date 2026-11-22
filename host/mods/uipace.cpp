@@ -39,6 +39,11 @@
 
 extern "C" uint64_t snap_present_count();   // host/boot.cpp
 extern "C" int snap_window_frame_cap();     // host/window_opts.cpp: fps, 0 = none (nvn Pace() reads it too)
+extern "C" __attribute__((weak)) bool snap_ui_pointer_1080(float* gx, float* gy) {
+    (void)gx;
+    (void)gy;
+    return false;
+}
 namespace nvn { extern double g_paceHz; }   // runtime/nvn/nvn_vk.cpp: rate of present interval 1, 0 = display-paced only
 
 namespace {
@@ -191,6 +196,28 @@ extern "C" void rt_gm_ui_pointer(Cpu* c) {
     if (g_ui_on && uipace::above60(period_ns())) hover_seen(c->x[21]);
     float t;
     std::memcpy(&t, &c->v[1], sizeof t);
+    const uint64_t o = c->x[21];
+    if (o && ptr_valid(o + 0x118)) {
+        float gx = 0.0f, gy = 0.0f;
+        if (snap_ui_pointer_1080(&gx, &gy)) {
+            std::memcpy((void*)(o + 0x118), &gx, 4);
+            std::memcpy((void*)(o + 0x11c), &gy, 4);
+        }
+        static const bool mdbg = std::getenv("SNAP_MOUSE_DEBUG") && std::atoi(std::getenv("SNAP_MOUSE_DEBUG")) != 0;
+        if (mdbg) {
+            static float px_prev = -1e9f, py_prev = -1e9f;
+            static int pcnt = 0;
+            float px = 0.0f, py = 0.0f;
+            std::memcpy(&px, (const void*)(o + 0x118), 4);
+            std::memcpy(&py, (const void*)(o + 0x11c), 4);
+            if ((pcnt++ % 60) == 0 || (px - px_prev) > 0.5f || (px_prev - px) > 0.5f ||
+                (py - py_prev) > 0.5f || (py_prev - py) > 0.5f) {
+                std::fprintf(stderr, "[mouse_dbg][ui_pointer] obj=%#llx pos=(%.2f,%.2f)\n", (unsigned long long)o, px, py);
+                px_prev = px;
+                py_prev = py;
+            }
+        }
+    }
     if (g_trace) {   // per second: frames with a game time / with 0, and how far the pointer (x21+0x118, +0x11c) moved
         // speed = the last frame's step over the real time since the previous call; the median over moving frames is the pointer speed
         static uint64_t n_zero, n_time, win_ns, last_ns;

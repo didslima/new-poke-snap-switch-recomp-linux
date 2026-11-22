@@ -231,7 +231,7 @@ if(UNIX AND NOT APPLE)
   if(EXISTS "${SNAP_AOT_MAIN_LIB}" AND EXISTS "${SNAP_AOT_SDK_LIB}")
     snap_os_test(snap_boot_linux ${SNAP_LINUX_RUNNER_SOURCES}
                  host/linux/init_linux.cpp host/linux/hooks_mods_stub.cpp host/linux/window_sdl3.cpp
-                 host/loader.cpp host/hooks.cpp host/guest_tls_hooks.cpp host/mods/drpfast.cpp host/mods/uipace.cpp
+                 host/loader.cpp host/hooks.cpp host/guest_tls_hooks.cpp host/mods/drpfast.cpp host/mods/uipace.cpp host/mods/ride_mouse_cam.cpp
                  host/mods/photoexport.cpp host/linux/photoexport_posix.cpp
                  host/abi_audio.cpp runtime/audio/linux/audio_sdl3.cpp runtime/hle/linux/input_backend_sdl3.cpp
                  generated/unimplemented.cpp generated/boot/nvn_bridge.cpp)
@@ -290,15 +290,20 @@ if(UNIX AND NOT APPLE)
   target_include_directories(snap_uipace_linux_test PRIVATE host)
   add_test(NAME uipace_linux COMMAND snap_uipace_linux_test)
 
-  snap_os_test(snap_hle_core_linux_test tests/platform/hle_core_linux_test.cpp ${SNAP_LINUX_HLE_CORE_SOURCES} runtime/os/perf.cpp runtime/os/linux/os_host_posix.cpp)
+  snap_os_test(snap_hle_core_linux_test tests/platform/hle_core_linux_test.cpp ${SNAP_LINUX_HLE_CORE_SOURCES} runtime/hle/zip_read.cpp runtime/mods/mods_core.cpp runtime/os/perf.cpp runtime/os/linux/os_host_posix.cpp)
   target_compile_options(snap_hle_core_linux_test PRIVATE -w)
   add_test(NAME hle_core_linux COMMAND snap_hle_core_linux_test)
+
+  add_executable(snap_audio_dsp_linux_test tests/audio/dsp_test.cpp)
+  target_include_directories(snap_audio_dsp_linux_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/audio)
+  target_compile_options(snap_audio_dsp_linux_test PRIVATE -w)
+  add_test(NAME audio_dsp_linux COMMAND snap_audio_dsp_linux_test)
 
   snap_os_test(snap_fs_linux_test tests/platform/fs_linux_test.cpp ${SNAP_LINUX_HLE_CORE_SOURCES} runtime/os/perf.cpp runtime/os/linux/os_host_posix.cpp)
   target_compile_options(snap_fs_linux_test PRIVATE -w)
   add_test(NAME fs_linux COMMAND snap_fs_linux_test)
 
-  snap_os_test(snap_hid_linux_test tests/platform/hid_linux_test.cpp ${SNAP_LINUX_HLE_CORE_SOURCES} runtime/os/perf.cpp runtime/os/linux/os_host_posix.cpp)
+  snap_os_test(snap_hid_linux_test tests/platform/hid_linux_test.cpp host/mods/ride_mouse_cam.cpp ${SNAP_LINUX_HLE_CORE_SOURCES} runtime/os/perf.cpp runtime/os/linux/os_host_posix.cpp)
   target_compile_options(snap_hid_linux_test PRIVATE -w)
   add_test(NAME hid_linux COMMAND snap_hid_linux_test)
 

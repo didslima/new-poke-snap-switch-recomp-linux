@@ -12,6 +12,13 @@ namespace snap::ui::host {
 
 bool init_platform(void* native_window);
 void new_frame(ImGuiIO& io, float width, float height);
+inline void scale_window_pos_to_display(float wx, float wy, int win_w, int win_h,
+                                        float disp_w, float disp_h, float* out_x, float* out_y) {
+  const float sx = (win_w > 0 && disp_w > 0.0f) ? (disp_w / static_cast<float>(win_w)) : 1.0f;
+  const float sy = (win_h > 0 && disp_h > 0.0f) ? (disp_h / static_cast<float>(win_h)) : 1.0f;
+  if (out_x) *out_x = wx * sx;
+  if (out_y) *out_y = wy * sy;
+}
 void shutdown_platform();
 void release_cursor_confine();
 

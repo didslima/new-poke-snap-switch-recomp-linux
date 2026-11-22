@@ -374,6 +374,8 @@ static void AaFail() {
   if (g_ssaaScale > 0.f && g_scale.scale == g_ssaaScale) { fprintf(stderr, "aa: render scale %.3f reset to 1 (AA disabled)\n", g_ssaaScale); g_scale.scale = 1.0f; g_ssaaScale = 0.f; }
 }
 
+bool AaFailed() { return g.failed; }
+
 float AaParseEnv() {
   if (g_parsed) return 0.f;
   g_parsed = true;

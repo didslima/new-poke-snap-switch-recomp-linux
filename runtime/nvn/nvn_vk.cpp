@@ -24,6 +24,7 @@
 #include "nvn_pace.h"   // [pace] frame clock for the limiter and the guest vsync (SNAP_PACE=legacy restores the old limiter)
 #include "upscale/upscale_nvn.h"   // [upscale] DLSS / FSR / XeSS (SNAP_UPSCALER)
 #include "nvn_framegen.h"          // [framegen] FSR frame generation (SNAP_FRAMEGEN)
+#include "nvn_motionaa.h"          // [motionaa] image stability rows, SNAP_AA_PROBE test pan
 #include "nvn_shot.h"              // screenshot key (F12)
 #include "os/perf.h"   // SNAP_PERF instrumentation (off unless the env var is set)
 // runtime/os: give the virtual core back while pacing. Optional host/UI/OS hooks below have no-op fallbacks
@@ -411,6 +412,7 @@ void Host::Shutdown() {
   if (device) FgDestroy(this);   // [framegen] (before the upscaler: it shares the FidelityFX device)
   if (device) UpscaleDestroy(this);   // [upscale]
   if (device) snap_rt::DeviceShutdown(this);   // [rt]
+  if (device) MotionAaShutdown(this);   // [motionaa] before GraveDrain / vkDestroyDevice
   if (device) DestroyHostExtras(this);
   if (device) GraveDrain(this);   // [nvnfix] retired textures, samplers, pools, programs (the device is idle)
   if (device) { TexPrefetchShutdown(); ScratchPoolDrain(this); SubMemDrain(this); }   // [perf] staged prefetch images, recycled scratch buffers, shared blocks
@@ -1286,6 +1288,7 @@ static void EmitViewport(ReplayCtx& cx, int i) {
   VkViewport vp = MakeNvnViewport(cx.h->originMode, v[0], v[1], v[2], v[3], cx.vpScale);
   if (cx.vpSx != cx.vpScale || cx.vpOx != 0.0f) { vp.x = cx.vpOx + v[0] * cx.vpSx; vp.width = v[2] * cx.vpSx; }
   { float jx, jy; UpscaleViewportJitter(cx, &jx, &jy); vp.x += jx; vp.y += jy; }   // [upscale] sub-pixel jitter of the scene's draws
+  { float px, py; MotionAaProbeOffset(cx, &px, &py); vp.x += px; vp.y += py; }       // [motionaa] SNAP_AA_PROBE test pan (dev loop only)
   vkCmdSetViewport(cx.cb, (uint32_t)i, 1, &vp);
 }
 static void EmitScissor(ReplayCtx& cx, int i) {
@@ -1339,12 +1342,13 @@ static void Replay(ReplayCtx& cx, const CmdList& list) {
           const size_t o = (size_t)k * (1 + sizeof(TexView));
           if (rt[k] && c.blob.size() >= o + 1 + sizeof(TexView) && c.blob[o]) { memcpy(&cx.rtView[k], &c.blob[o + 1], sizeof(TexView)); cx.rtHasView[k] = true; }
         }
+        HdfxAuditTargets(rt);
         RedirectCompressedTargets(cx);
         if (DebugDrawLogActive()) DebugDrawLog("SetRenderTargets rt0=%p(%dx%d f%x) depth=%p\n", (void*)rt[0], rt[0] ? rt[0]->b.width : 0, rt[0] ? rt[0]->b.height : 0, rt[0] ? rt[0]->b.format : 0, (void*)rt[8]);
         // render scale changed: viewports / scissors set for the previous targets are re-applied at the new scale
         if (FxOnSetRenderTargets(cx)) { for (int i = 0; i < 4; i++) { if (cx.vpHave & (1u << i)) EmitViewport(cx, i); if (cx.scHave & (1u << i)) EmitScissor(cx, i); } }   // [fx] pre-tonemap slot, before the upscaler reads the scene colour; its passes changed the viewport / scissor state
         { const bool jit = UpscaleOnSetRenderTargets(cx);   // [upscale] scene / upscale point; jitter changed: re-emit viewports
-          if (jit && cx.vpHave) for (int i = 0; i < 4; i++) if (cx.vpHave & (1u << i)) EmitViewport(cx, i); }
+          if ((jit || MotionAaProbeMoving()) && cx.vpHave) for (int i = 0; i < 4; i++) if (cx.vpHave & (1u << i)) EmitViewport(cx, i); }
         if (cx.vpHave && (RtScale(cx) != cx.vpScale || g_wideK > 1.0f)) for (int i = 0; i < 4; i++) if (cx.vpHave & (1u << i)) EmitViewport(cx, i);   // [wide] x mapping may differ per target
         if (cx.scHave && (RtScale(cx) != cx.scScale || g_wideK > 1.0f)) for (int i = 0; i < 4; i++) if (cx.scHave & (1u << i)) EmitScissor(cx, i);
         break;
@@ -2089,9 +2093,11 @@ static bool PresentWindowOnce(QueueImpl* q, WindowImpl* w, int slot) {
   si.waitSemaphoreInfoCount = 1; si.pWaitSemaphoreInfos = &wait;
   si.commandBufferInfoCount = 1; si.pCommandBufferInfos = &cbi;
   si.signalSemaphoreInfoCount = 2; si.pSignalSemaphoreInfos = sig;
-  { snap_perf::Scope perfScope(snap_perf::C_QSUBMIT); VKCHK(vkQueueSubmit2(h->queue, 1, &si, VK_NULL_HANDLE)); }
+  VkResult subR = VK_SUCCESS;
+  { snap_perf::Scope perfScope(snap_perf::C_QSUBMIT); subR = vkQueueSubmit2(h->queue, 1, &si, VK_NULL_HANDLE); VKCHK(subR); }
   PerfGpuSubmitted(perfSlot, v);
-  RetargetAfterSubmit();   // the old images go to the graveyard behind this submit
+  if (subR >= 0) RetargetAfterSubmit();
+  else { static bool once; if (!once) { once = true; LogError("present submit failed (%d): render-target resize not retired this frame", (int)subR); } RetargetSubmitFailed(); }
   if (spRecorded) { spFlight = true; spVal = v; }   // the starting-note sample above is readable once the timeline reaches v
   q->inflight.push_back({v, cb, nullptr});
   if (fdBuf && fdHdr) {

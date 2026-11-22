@@ -35,7 +35,13 @@ void FoliageLogDraw(const FoliageDrawInfo& d);   // debug census (SNAP_FOLIAGE_L
 
 // SPIR-V wrapper for alpha-tested fragment modules (nvn_foliage.cpp): `in` is the translated module, `out` replaces it; spec constant 0 = alpha reference.
 // hash: dithered / covered edge; leaf: 0..8 back-lit gain level (needs the scene light and camera constant buffers; ignored when the module has none).
-bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool hash, int leaf, std::vector<uint32_t>& out);
+// covVar (Foliage stability): a Private float variable holding the mip level the alpha texture was read at (PatchCaptureAlphaLod); the tested alpha is
+// a * (1 + 0.25 * max(lod, 0)), so the smaller mips keep the coverage of the full-size texture. 0 = none.
+bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool hash, int leaf, std::vector<uint32_t>& out, uint32_t covVar = 0);
+// Foliage stability: after the first 2D (not arrayed) implicit-lod sample of the module, stores OpImageQueryLod(...).x (the mip level read) into a new
+// Private float variable (*lodVar). Returns false when the module has no such sample (the caller keeps the module as it was).
+bool PatchCaptureAlphaLod(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint32_t* lodVar);
+bool FoliageAaPrepass();       // the depth pre-pass gets the same dithered edge as the colour pass (SNAP_FOLIAGE_AA_PREPASS=1, test aid; default the hard test)
 // Wind sway (SNAP_WIND_SWAY, 0..1): vertex wrapper that adds a small world-space wind displacement to alpha-tested scene draws (nvn_foliage.cpp). PipeDesc.pad2 bits 17..20 = level 0..8;
 // the pipeline builder asks FoliageSwayModule for the patched vertex module (null = keep the game one) and passes FoliageSwayAmpFor(level) as specialization constant 0.
 bool PatchVertexSway(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
@@ -55,6 +61,7 @@ uint32_t FoliagePipeBits(int alphaFunc, float alphaRef, int32_t colorVkFmt, int3
 float FoliageParticleBoost(const void* tex, uint32_t w, uint32_t h, uint32_t fmt, const uint64_t* chainRel, int n);
 void FoliageTextureGone(const void* tex);
 char FoliageTexLabel(const void* tex);
+float FoliageParticleBoostLive(const void* tex, float created);
 
 bool FoliageAaEnabled();    // SNAP_FOLIAGE_AA
 float FoliageLeafStrength();   // SNAP_LEAF_TRANSLUCENCY

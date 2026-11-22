@@ -14,6 +14,7 @@ extern float g_aaSharpen;   // contrast adaptive sharpening strength, 0 = off
 extern bool g_aaUpscalerOn; // an upscaler runs (nvn_entry.cpp ApplyHostEnvPolicy): sharpening stays off unless SNAP_SHARPEN is set
 // Parses SNAP_AA / SNAP_SHARPEN once. Returns the render scale SNAP_AA=ssaa2 asks for (2x the window height / 1080, capped at 3.0 and 8192 px), or 0.
 float AaParseEnv();
+bool AaFailed();
 float AaReparseLive(bool* blocked);   // live options: SNAP_AA read again (nvn_retarget.cpp); *blocked when the mode could not follow
 // Window client height in pixels (SNAP_WINDOW_H, window.json, else 720). Used by ssaa2 and by the upscaler.
 int HostWindowHeight();

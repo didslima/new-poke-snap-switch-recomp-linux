@@ -18,11 +18,15 @@
 extern "C" void snap_photoexport_drain_for_exit(int ms);
 
 static float g_test_wide_k = 2.0f;
+static float g_test_ui_aspect = -1.0f;
 extern "C" float nvnHostGetUltrawide(void) { return g_test_wide_k; }
+extern "C" void nvnHostSetUiPresentAspect(float a) { g_test_ui_aspect = a; }
 
 extern "C" {
 void rt_hook_setjmp(Cpu *c);
 void rt_hook_longjmp(Cpu *c);
+void rt_gm_route_ui_event(Cpu *c);
+void rt_gm_neo_speed(Cpu *c);
 }
 void snap_memev(char k, uint64_t a, uint64_t sz, uint64_t lr);
 void snap_memlog_find(uint64_t addr);
@@ -286,6 +290,38 @@ int main() {
         unsetenv("SNAP_PHOTO_DIR");
         unsetenv("SNAP_PHOTO_MIN_W");
         unsetenv("SNAP_PHOTO_LOG");
+    }
+
+    // 6. Photodex (zukan_index) enforces 16:9 aspect & disables camera widening; exiting restores ultrawide.
+    {
+        struct FakeUiPlayer {
+            uint64_t vt = 0x7100000000ull + 0xc92020ull;
+            uint64_t pad = 0;
+            uint8_t str[24]{};
+        } player{};
+        const char *scene = "zukan_index";
+        const size_t slen = std::strlen(scene);
+        player.str[0] = static_cast<uint8_t>(slen << 1);
+        std::memcpy(player.str + 1, scene, slen);
+        uint8_t st_str[24]{};
+        st_str[0] = 2;
+        st_str[1] = 'M';
+        int ev = 2;  // opened
+        uint64_t pp = reinterpret_cast<uint64_t>(&player);
+        Cpu c{};
+        c.x[1] = reinterpret_cast<uint64_t>(&ev);
+        c.x[2] = reinterpret_cast<uint64_t>(&pp);
+        c.x[3] = reinterpret_cast<uint64_t>(st_str);
+        rt_gm_route_ui_event(&c);
+        CHECK(std::fabs(g_test_ui_aspect - (16.0f / 9.0f)) < 1e-4f);
+
+        // Closing zukan_index (ev = 3) restores 0.0f (32:9 auto).
+        ev = 3;
+        rt_gm_route_ui_event(&c);
+        CHECK(g_test_ui_aspect == 0.0f);
+
+        c.x[19] = 0;
+        rt_gm_neo_speed(&c);
     }
 
     std::printf("hooks_linux_test: %d checks, %d failures\n", g_checks.load(), g_fail.load());

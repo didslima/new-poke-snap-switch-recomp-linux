@@ -21,6 +21,8 @@
 #include "hle/hle_host.h"
 #include "hle/settings.h"
 #include "hle/svc_common.h"
+#include "hle/zip_read.h"
+#include "mods/mods_core.h"
 
 namespace fs = std::filesystem;
 
@@ -298,10 +300,85 @@ static void test_services_sys() {
     hle::config().headless = orig_headless;
 }
 
+static void test_zip_and_mods_safety() {
+    // 1. Valid pack IDs pass.
+    CHECK(mods::safe_pack_id("hd_textures"));
+    CHECK(mods::safe_pack_id("my-mod_v1.2"));
+    CHECK(mods::safe_pack_id("cool mod"));
+
+    // 2. Path traversal, separators, trailing dot/space, control chars, and DOS devices are refused.
+    CHECK(!mods::safe_pack_id(""));
+    CHECK(!mods::safe_pack_id("."));
+    CHECK(!mods::safe_pack_id(".."));
+    CHECK(!mods::safe_pack_id("../escape"));
+    CHECK(!mods::safe_pack_id("a/b"));
+    CHECK(!mods::safe_pack_id("a\\b"));
+    CHECK(!mods::safe_pack_id("pack."));
+    CHECK(!mods::safe_pack_id("pack "));
+    CHECK(!mods::safe_pack_id(".. "));
+    CHECK(!mods::safe_pack_id("con"));
+    CHECK(!mods::safe_pack_id("NUL.zip"));
+    CHECK(!mods::safe_pack_id("com1"));
+    CHECK(!mods::safe_pack_id("lpt9.txt"));
+    CHECK(!mods::safe_pack_id("bad\x01id"));
+
+    // 3. unpack_zip / pack_info refuse unsafe ids without touching disk.
+    const fs::path tmp = fs::temp_directory_path() / ("snap_mods_safe_test_" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    CHECK(fs::create_directories(tmp, ec));
+    std::vector<std::string> warn;
+    CHECK(mods::unpack_zip(tmp.string(), "../escape", warn).empty());
+    CHECK(!warn.empty());
+    mods::Pack pk;
+    warn.clear();
+    CHECK(!mods::pack_info(tmp.string(), "con", pk, warn));
+    CHECK(!warn.empty());
+
+    // 4. zip_read deflate-bomb guard: a deflate entry declaring 1 byte but inflating 10 bytes is refused.
+    // Raw deflate block for 10x 'A': stored block header 0x01, len=10 (0x000a), nlen=0xfff5, followed by 10*'A'.
+    // Craft a minimal valid ZIP with declared uncompressed size = 1, actual inflated = 10.
+    const fs::path bomb_zip = tmp / "bomb.zip";
+    const uint8_t deflated[] = {0x01, 0x0a, 0x00, 0xf5, 0xff, 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A'};
+    auto w16 = [](std::vector<uint8_t>& b, uint16_t v) { b.push_back(v & 0xff); b.push_back((v >> 8) & 0xff); };
+    auto w32 = [](std::vector<uint8_t>& b, uint32_t v) {
+        b.push_back(v & 0xff); b.push_back((v >> 8) & 0xff); b.push_back((v >> 16) & 0xff); b.push_back((v >> 24) & 0xff);
+    };
+    std::vector<uint8_t> z;
+    const char fname[] = "test.txt";
+    // Local file header
+    w32(z, 0x04034b50u); w16(z, 20); w16(z, 0); w16(z, 8); w16(z, 0); w16(z, 0);
+    w32(z, 0); w32(z, sizeof(deflated)); w32(z, 1 /* declared size 1 < 10 */);
+    w16(z, sizeof(fname) - 1); w16(z, 0);
+    z.insert(z.end(), fname, fname + sizeof(fname) - 1);
+    z.insert(z.end(), deflated, deflated + sizeof(deflated));
+    const uint32_t cd_off = static_cast<uint32_t>(z.size());
+    // Central directory header
+    w32(z, 0x02014b50u); w16(z, 20); w16(z, 20); w16(z, 0); w16(z, 8); w16(z, 0); w16(z, 0);
+    w32(z, 0); w32(z, sizeof(deflated)); w32(z, 1);
+    w16(z, sizeof(fname) - 1); w16(z, 0); w16(z, 0); w16(z, 0); w16(z, 0); w32(z, 0); w32(z, 0);
+    z.insert(z.end(), fname, fname + sizeof(fname) - 1);
+    const uint32_t cd_size = static_cast<uint32_t>(z.size()) - cd_off;
+    // EOCD
+    w32(z, 0x06054b50u); w16(z, 0); w16(z, 0); w16(z, 1); w16(z, 1); w32(z, cd_size); w32(z, cd_off); w16(z, 0);
+    {
+        std::ofstream f(bomb_zip, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(z.data()), static_cast<std::streamsize>(z.size()));
+    }
+    std::vector<hle::zipr::Entry> entries;
+    std::string zerr;
+    CHECK(hle::zipr::list(bomb_zip, entries, &zerr));
+    CHECK(entries.size() == 1);
+    CHECK(!hle::zipr::extract(bomb_zip, entries[0], tmp / "out.txt", &zerr));
+
+    fs::remove_all(tmp, ec);
+}
+
 int main() {
     test_registry();
     test_config_and_xdg();
     test_services_sys();
+    test_zip_and_mods_safety();
     std::printf("hle_core_linux_test: %d checks, %d failures\n", g_checks.load(), g_fail.load());
     return g_fail.load() ? 1 : 0;
 }

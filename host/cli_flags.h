@@ -40,6 +40,12 @@ struct Parsed {
   std::string error;                                       // not empty: print it and exit 2
 };
 
+inline std::string on_off(const std::string& s) {
+  if (s == "on" || s == "1" || s == "true" || s == "yes") return "1";
+  if (s == "off" || s == "0" || s == "false" || s == "no") return "0";
+  return "";
+}
+
 inline bool is_number(const std::string& s) {
   if (s.empty() || s.size() > 6) return false;
   for (char c : s) if (c < '0' || c > '9') return false;
@@ -75,6 +81,20 @@ inline Parsed parse(const std::vector<std::string>& args) {
     else if (a == "--steam-deck") {
       for (auto& kv : snapdeck::env()) p.env.push_back(kv);
       for (const snapdeck::Kv& kv : snapdeck::cfg()) p.sets.push_back({kv.key, kv.val});
+    }
+    else if (a == "--pause-in-background" || a == "--mute-in-background" || a == "--update-check") {
+      if (!value(i, &v)) break;
+      const std::string b = on_off(v);
+      if (b.empty()) { p.error = a + " needs on or off, got \"" + v + "\""; break; }
+      p.env.push_back({a == "--pause-in-background" ? "SNAP_WINDOW_PAUSE" : a == "--mute-in-background" ? "SNAP_WINDOW_MUTE_BG" : "SNAP_UPDATE_CHECK", b});
+    } else if (a == "--frame-cap") {
+      if (!value(i, &v)) break;
+      if (!is_number(v)) { p.error = a + " needs a whole number of frames per second (0 = no extra limit), got \"" + v + "\""; break; }
+      p.env.push_back({"SNAP_WINDOW_FRAME_CAP", v});
+    } else if (a == "--update-channel") {
+      if (!value(i, &v)) break;
+      if (v != "stable" && v != "testing") { p.error = a + " needs stable or testing, got \"" + v + "\""; break; }
+      p.env.push_back({"SNAP_UPDATE_CHANNEL", v});
     }
     else if (a == "--monitor" || a == "--width" || a == "--height") {
       if (!value(i, &v)) break;

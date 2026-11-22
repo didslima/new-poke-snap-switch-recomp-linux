@@ -6,9 +6,16 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "../hle.h"
@@ -70,35 +77,71 @@ class Sdl3Backend final : public Backend {
   }
 
   ~Sdl3Backend() override {
-    for (SDL_Gamepad* p : pads_) {
-      if (p) SDL_CloseGamepad(p);
+    {
+      std::lock_guard<std::mutex> lk(wake_mu_);
+      stop_.store(true);
     }
-    pads_.clear();
+    wake_cv_.notify_all();
+    if (scan_thread_.joinable()) scan_thread_.join();
+    if (gyro_thread_.joinable()) gyro_thread_.join();
+    {
+      std::lock_guard<std::mutex> lk(pads_mu_);
+      for (SDL_Gamepad* p : pads_) {
+        if (p) SDL_CloseGamepad(p);
+      }
+      pads_.clear();
+    }
     if (inited_) SDL_QuitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK);
   }
 
   const char* name() const override { return "sdl3"; }
 
+  void set_cursor_mode(bool lock, bool recenter) override {
+    lock_.store(lock, std::memory_order_relaxed);
+    recenter_.store(recenter, std::memory_order_relaxed);
+    set_sdl3_cursor_mode(lock, recenter);
+  }
+
   void poll(RawInput& out) override {
     if (!inited_) return;
     const uint64_t now_ns = static_cast<uint64_t>(SDL_GetTicksNS());
-    if (!last_scan_ns_ || pads_.empty() || now_ns - last_scan_ns_ > 1000000000ull) {
-      last_scan_ns_ = now_ns;
-      scan_pads();
-    }
-    SDL_UpdateGamepads();
-
-    // Drop any pad that disconnected between scans.
-    for (size_t i = 0; i < pads_.size();) {
-      if (!SDL_GamepadConnected(pads_[i])) {
-        SDL_CloseGamepad(pads_[i]);
-        pads_.erase(pads_.begin() + static_cast<std::ptrdiff_t>(i));
-      } else {
-        ++i;
+    if (scan_threaded_) {
+      if (!scan_thread_.joinable()) {
+        scan_thread_ = std::thread([this] {
+          while (!stop_.load()) {
+            {
+              std::lock_guard<std::mutex> slk(scan_mu_);
+              scan_pads();
+            }
+            std::unique_lock<std::mutex> wlk(wake_mu_);
+            wake_cv_.wait_for(wlk, std::chrono::milliseconds(1000), [this] { return stop_.load(); });
+          }
+        });
       }
+      bool any_connected = false;
+      {
+        std::lock_guard<std::mutex> plk(pads_mu_);
+        for (SDL_Gamepad* p : pads_) {
+          if (SDL_GamepadConnected(p)) { any_connected = true; break; }
+        }
+      }
+      if (!any_connected && SDL_HasJoystick()) {
+        std::lock_guard<std::mutex> slk(scan_mu_);
+        if (failed_.empty()) scan_pads();
+      }
+      SDL_UpdateGamepads();
+    } else if (!last_scan_ns_ || now_ns - last_scan_ns_ > 1000000000ull) {
+      last_scan_ns_ = now_ns;
+      std::lock_guard<std::mutex> slk(scan_mu_);
+      scan_pads();
+      SDL_UpdateGamepads();
+    } else {
+      SDL_UpdateGamepads();
     }
 
+    std::lock_guard<std::mutex> lk(pads_mu_);
     for (SDL_Gamepad* pad : pads_) {
+      if (!SDL_GamepadConnected(pad)) continue;
       RawInput r;
       r.pad_connected = true;
       r.pad_family = family_of(SDL_GetGamepadType(pad));
@@ -130,7 +173,18 @@ class Sdl3Backend final : public Backend {
       r.lt = std::max(0.0f, ax(SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
       r.rt = std::max(0.0f, ax(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
 
-      if (pad_fx().gyro_on.load() && SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) {
+      const bool avg = pad_fx().gyro_on.load() && pad_fx().gyro_avg.load();
+      if (avg && !gyro_thread_.joinable() && !stop_.load()) {
+        gyro_thread_ = std::thread([this] { gyro_loop(); });
+      }
+      if (avg && SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) {
+        if (!SDL_GamepadSensorEnabled(pad, SDL_SENSOR_GYRO)) {
+          SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+        }
+        std::lock_guard<std::mutex> ga(gavg_mu_);
+        gavg_.take(&r.gyro_x, &r.gyro_y, &r.gyro_z);
+        r.gyro_present = true;
+      } else if (pad_fx().gyro_on.load() && SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) {
         if (!SDL_GamepadSensorEnabled(pad, SDL_SENSOR_GYRO)) {
           SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
         }
@@ -176,25 +230,63 @@ class Sdl3Backend final : public Backend {
       if (mb & SDL_BUTTON_LMASK) out.mouse_buttons |= 1;
       if (mb & SDL_BUTTON_RMASK) out.mouse_buttons |= 2;
       if (mb & SDL_BUTTON_MMASK) out.mouse_buttons |= 4;
-      SDL_Window* w = SDL_GetMouseFocus();
-      int ww = 0, wh = 0;
-      if (w && SDL_GetWindowSize(w, &ww, &wh) && ww > 0 && wh > 0) {
-        out.mouse_in_window = true;
-        out.mouse_x = mx / static_cast<float>(ww);
-        out.mouse_y = my / static_cast<float>(wh);
+      if (mb & SDL_BUTTON_X1MASK) out.mouse_buttons |= 8;
+      if (mb & SDL_BUTTON_X2MASK) out.mouse_buttons |= 16;
+      float pnx = 0.0f, pny = 0.0f;
+      bool pin = false;
+      if (read_posted_mouse_pos(&pnx, &pny, &pin)) {
+        out.mouse_in_window = pin;
+        out.mouse_x = pnx;
+        out.mouse_y = pny;
+      } else {
+        SDL_Window* w = SDL_GetMouseFocus();
+        if (!w) w = SDL_GetKeyboardFocus();
+        int ww = 0, wh = 0;
+        if (w && SDL_GetWindowSize(w, &ww, &wh) && ww > 0 && wh > 0) {
+          out.mouse_in_window = (mx >= 0.0f && my >= 0.0f && mx < static_cast<float>(ww) && my < static_cast<float>(wh));
+          out.mouse_x = mx / static_cast<float>(ww);
+          out.mouse_y = my / static_cast<float>(wh);
+        }
       }
+      const bool recenter = recenter_.load(std::memory_order_relaxed);
       float dx = 0.0f, dy = 0.0f;
-      SDL_GetRelativeMouseState(&dx, &dy);
+      uint64_t ev_cnt = 0;
+      if (raw_mouse().events.load(std::memory_order_relaxed) > 0) {
+        raw_mouse().take(&dx, &dy, &ev_cnt);
+        SDL_GetRelativeMouseState(nullptr, nullptr);
+      } else {
+        SDL_GetRelativeMouseState(&dx, &dy);
+      }
+      // Discard deltas on focus regain or recenter transition to avoid a camera jump.
+      if (!was_focused_ || (recenter && !was_recenter_)) {
+        dx = 0.0f;
+        dy = 0.0f;
+        ev_cnt = 0;
+      }
       out.mouse_dx = dx;
       out.mouse_dy = dy;
+      out.mouse_poll_events = static_cast<uint32_t>(ev_cnt);
+      was_focused_ = true;
+      was_recenter_ = recenter;
+    } else {
+      if (was_focused_) {
+        float tmp_x = 0.0f, tmp_y = 0.0f;
+        raw_mouse().take(&tmp_x, &tmp_y);
+        SDL_GetRelativeMouseState(nullptr, nullptr);
+      }
+      was_focused_ = false;
+      was_recenter_ = false;
     }
   }
 
   void rumble(float low, float high) override {
-    if (!inited_ || pads_.empty()) return;
+    if (!inited_) return;
+    std::lock_guard<std::mutex> lk(pads_mu_);
+    if (pads_.empty()) return;
     const Uint16 lo = static_cast<Uint16>(std::clamp(low, 0.0f, 1.0f) * 65535.0f);
     const Uint16 hi = static_cast<Uint16>(std::clamp(high, 0.0f, 1.0f) * 65535.0f);
     for (SDL_Gamepad* pad : pads_) {
+      if (!SDL_GamepadConnected(pad)) continue;
       if (!SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false)) continue;
       SDL_RumbleGamepad(pad, lo, hi, (lo || hi) ? 500 : 0);
     }
@@ -202,27 +294,102 @@ class Sdl3Backend final : public Backend {
 
  private:
   void scan_pads() {
+    // scan_pads() has one caller at a time (either scan_thread_ or poll() when SNAP_SDL_SCAN_THREAD=0).
+    std::vector<SDL_Gamepad*> disconnected;
+    {
+      std::lock_guard<std::mutex> lk(pads_mu_);
+      for (size_t i = 0; i < pads_.size();) {
+        if (!SDL_GamepadConnected(pads_[i])) {
+          disconnected.push_back(pads_[i]);
+          pads_.erase(pads_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+          ++i;
+        }
+      }
+    }
+    for (SDL_Gamepad* gone : disconnected) SDL_CloseGamepad(gone);
+
     int n = 0;
     SDL_JoystickID* ids = SDL_GetJoysticks(&n);
+    const uint64_t now_ns = static_cast<uint64_t>(SDL_GetTicksNS());
+    for (size_t i = 0; i < failed_.size();) {
+      bool still_present = false;
+      for (int k = 0; k < n; ++k) {
+        if (ids[k] == failed_[i].first) { still_present = true; break; }
+      }
+      if (!still_present) failed_.erase(failed_.begin() + static_cast<std::ptrdiff_t>(i));
+      else ++i;
+    }
+
     for (int k = 0; k < n; ++k) {
       const SDL_JoystickID id = ids[k];
       if (!SDL_IsGamepad(id)) continue;
       bool already_open = false;
-      for (SDL_Gamepad* g : pads_) {
-        if (SDL_GetGamepadID(g) == id) {
-          already_open = true;
-          break;
+      {
+        std::lock_guard<std::mutex> lk(pads_mu_);
+        for (SDL_Gamepad* g : pads_) {
+          if (SDL_GetGamepadID(g) == id) {
+            already_open = true;
+            break;
+          }
         }
       }
       if (already_open) continue;
-      if (SDL_Gamepad* g = SDL_OpenGamepad(id)) pads_.push_back(g);
+      auto fit = std::find_if(failed_.begin(), failed_.end(), [id](const auto& p) { return p.first == id; });
+      if (fit != failed_.end() && now_ns - fit->second < 3000000000ull) continue;
+      if (SDL_Gamepad* g = SDL_OpenGamepad(id)) {
+        if (fit != failed_.end()) failed_.erase(fit);
+        std::lock_guard<std::mutex> lk(pads_mu_);
+        pads_.push_back(g);
+      } else {
+        if (fit != failed_.end()) fit->second = now_ns;
+        else failed_.emplace_back(id, now_ns);
+      }
     }
     SDL_free(ids);
+  }
+
+  void gyro_loop() {
+    while (!stop_.load()) {
+      if (pad_fx().gyro_on.load() && pad_fx().gyro_avg.load()) {
+        std::lock_guard<std::mutex> pl(pads_mu_);
+        for (SDL_Gamepad* pad : pads_) {
+          if (!SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) continue;
+          if (!SDL_GamepadSensorEnabled(pad, SDL_SENSOR_GYRO)) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+          float g[3] = {0.0f, 0.0f, 0.0f};
+          if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3)) {
+            constexpr float kDeg = 57.29578f;
+            std::lock_guard<std::mutex> ga(gavg_mu_);
+            gavg_.add(g[0] * kDeg, g[1] * kDeg, g[2] * kDeg);
+          }
+          break;
+        }
+      }
+      SDL_Delay(1);
+    }
   }
 
   bool inited_ = false;
   uint64_t last_scan_ns_ = 0;
   std::vector<SDL_Gamepad*> pads_;
+  std::vector<std::pair<SDL_JoystickID, uint64_t>> failed_;
+  std::mutex pads_mu_;
+  std::mutex scan_mu_;
+  std::mutex wake_mu_;
+  std::condition_variable wake_cv_;
+  std::thread scan_thread_;
+  std::mutex gavg_mu_;
+  GyroAvg gavg_;
+  std::thread gyro_thread_;
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> lock_{false};
+  std::atomic<bool> recenter_{false};
+  bool was_focused_ = false;
+  bool was_recenter_ = false;
+  bool scan_threaded_ = [] {
+    const char* e = std::getenv("SNAP_SDL_SCAN_THREAD");
+    return !(e && *e == '0');
+  }();
 };
 
 }  // namespace

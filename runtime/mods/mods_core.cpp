@@ -238,8 +238,33 @@ std::vector<std::string> packs_on_disk(const std::string& root) {
   return ids;
 }
 
+// A pack id names one folder or zip directly under the mods root: no separators, drive colons, or "." / "..". Windows strips
+// trailing dots and spaces from a path name, so ".. " or ". " would name the mods root (or its parent) and unpack_zip's
+// remove_all would wipe it: an id may not end in a dot or a space. DOS device names (con, nul, com1, ...) are refused too,
+// with or without an extension, and the id must stay a single name directly under a base folder after normalizing.
+bool safe_pack_id(const std::string& id) {
+  if (id.empty() || id == "." || id == "..") return false;
+  if (id.back() == '.' || id.back() == ' ') return false;
+  for (char c : id) {
+    const unsigned char u = (unsigned char)c;
+    if (u < 0x20) return false;                                     // NUL and control characters
+    if (std::strchr("/\\:*?\"<>|", c)) return false;               // separators, drive colons, wildcards, other Windows-invalid
+  }
+  std::string stem = lower(id.substr(0, id.find('.')));
+  while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+  static const char* const kDev[] = {"con", "prn", "aux", "nul", "conin$", "conout$"};
+  for (const char* d : kDev) if (stem == d) return false;
+  if (stem.size() == 4 && (stem.compare(0, 3, "com") == 0 || stem.compare(0, 3, "lpt") == 0) && stem[3] >= '0' && stem[3] <= '9') return false;
+  if (stem.size() == 5 && (stem.compare(0, 3, "com") == 0 || stem.compare(0, 3, "lpt") == 0) && (unsigned char)stem[3] == 0xC2 &&
+      ((unsigned char)stem[4] == 0xB9 || (unsigned char)stem[4] == 0xB2 || (unsigned char)stem[4] == 0xB3)) return false;   // COM¹²³
+  const fs::path base = U("mods_root"), p = (base / U(id)).lexically_normal();
+  if (p.parent_path() != base || p.filename() != U(id)) return false;
+  return true;
+}
+
 std::string unpack_zip(const std::string& root, const std::string& id, std::vector<std::string>& warn) {
   std::error_code ec;
+  if (!safe_pack_id(id)) { warn.push_back("pack id \"" + id + "\" refused (not a plain folder name)"); return ""; }
   fs::path z = U(root) / U(id + ".zip"), base = unpacked_base(root), dst = base / U(id), st = base / U(id + ".stamp");
   const std::string want = zip_stamp(z);
   std::string have;
@@ -272,6 +297,7 @@ bool pack_info(const std::string& root, const std::string& id, Pack& p, std::vec
   std::error_code ec;
   p = Pack();
   p.id = id;
+  if (!safe_pack_id(id)) { warn.push_back("pack id \"" + id + "\" refused (not a plain folder name)"); return false; }
   fs::path folder = U(root) / U(id), z = U(root) / U(id + ".zip");
   if (fs::is_directory(folder, ec)) {
     p.dir = S8(folder);
@@ -334,6 +360,7 @@ void load(const std::string& root, Index& out, std::vector<std::string>& warn, b
   std::unordered_map<std::string, int> rom_seen;   // romfs/ path -> the pack that serves it
   for (auto& [id, en] : order) {
     Pack p;
+    if (!safe_pack_id(id)) { warn.push_back("mods.json: pack id \"" + id + "\" skipped (not a plain folder name)"); continue; }
     if (!pack_info(root, id, p, warn)) { warn.push_back(id + ": listed in mods.json but there is no folder or .zip of that name"); continue; }
     p.enabled = en;
     bool listed_only = false;   // an enabled zip read from its file list (unpack = false)

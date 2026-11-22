@@ -164,6 +164,46 @@ int main() {
   CHECK(snap_window_frame_cap() == 144);
 
   snap_linux::window_opts_shutdown();
+
+  // Fast boot tests: OFF (default), ON with vsync drop/restore, and SNAP_FAST_BOOT_VSYNC=0
+  {
+    static double g_pace = -1.0;
+    static std::string g_vsync = "on";
+    static int g_pace_calls = 0;
+    static int g_vsync_calls = 0;
+    snap_linux::FastBootHooks fbh{};
+    fbh.set_pacing = [](double hz) { g_pace = hz; ++g_pace_calls; };
+    fbh.get_vsync = []() -> const char* { return g_vsync.c_str(); };
+    fbh.set_vsync = [](const char* m) { g_vsync = m; ++g_vsync_calls; };
+
+    unsetenv("SNAP_FAST_BOOT");
+    unsetenv("SNAP_FAST_BOOT_FRAMES");
+    unsetenv("SNAP_FAST_BOOT_VSYNC");
+    CHECK(!snap_linux::fast_boot_on_present(1, 60.0, &fbh, true));
+    CHECK(g_pace_calls == 0 && g_vsync_calls == 0);
+
+    setenv("SNAP_FAST_BOOT", "1", 1);
+    setenv("SNAP_FAST_BOOT_FRAMES", "5", 1);
+    g_vsync = "on";
+    CHECK(snap_linux::fast_boot_on_present(1, 120.0, &fbh, true));
+    CHECK(g_pace == 0.0 && g_vsync == "off");
+    CHECK(snap_linux::fast_boot_on_present(2, 120.0, &fbh, false));
+    CHECK(!snap_linux::fast_boot_on_present(5, 120.0, &fbh, false));
+    CHECK(g_pace == 120.0 && g_vsync == "on");
+
+    // SNAP_FAST_BOOT_VSYNC=0 keeps vsync untouched
+    g_vsync = "adaptive";
+    g_vsync_calls = 0;
+    setenv("SNAP_FAST_BOOT_VSYNC", "0", 1);
+    CHECK(snap_linux::fast_boot_on_present(1, 60.0, &fbh, true));
+    CHECK(g_pace == 0.0 && g_vsync == "adaptive" && g_vsync_calls == 0);
+    CHECK(!snap_linux::fast_boot_on_present(5, 60.0, &fbh, false));
+    CHECK(g_pace == 60.0 && g_vsync == "adaptive" && g_vsync_calls == 0);
+    unsetenv("SNAP_FAST_BOOT");
+    unsetenv("SNAP_FAST_BOOT_FRAMES");
+    unsetenv("SNAP_FAST_BOOT_VSYNC");
+  }
+
   fs::remove_all(tmp, ec);
   if (g_fails) return 1;
   std::printf("window_opts_linux_test: all checks passed\n");

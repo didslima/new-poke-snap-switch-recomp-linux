@@ -19,6 +19,7 @@
 #include "hle/live.h"   // rows that apply with no restart
 #include "nvn_fx.h"
 #include "nvn_internal.h"
+#include "nvn_motionaa.h"
 #include "nvn_os_host.h"
 
 namespace nvn {
@@ -58,14 +59,19 @@ Live& L() {
   return l;
 }
 }  // namespace
-bool FoliageAaEnabled() { const int p = L().pick; return p ? (p == 1 || p == 4) : L().aa != 0; }
+bool FoliageAaEnabled() { const int ps = MotionAaProbeState(); if (ps >= 0) return (ps & 1) != 0; const int p = L().pick; return p ? (p == 1 || p == 4) : L().aa != 0; }
+bool FoliageAaPrepass() {
+  const int ps = MotionAaProbeState(); if (ps >= 0) return (ps & 2) != 0;
+  static const bool on = [] { const char* e = getenv("SNAP_FOLIAGE_AA_PREPASS"); return e && e[0] == '1'; }();
+  return on;
+}
 float FoliageLeafStrength() { const int p = L().pick; if (p) return (p == 2 || p == 4) ? 1.0f : 0.0f; const float f = L().leaf; return f < 0 ? 0.0f : f > 1 ? 1.0f : f; }
 bool SoftParticlesEnabled() { return L().soft != 0; }
 float FoliageSwayStrength() { const int p = L().pick; if (p) return (p == 3 || p == 4 || p == 5) ? 1.0f : 0.0f; const float f = L().sway; return f < 0 ? 0.0f : f > 1 ? 1.0f : f; }
 bool FoliageSwayZero() { return L().pick == 5; }   // debug pick 5: wrapper on, amplitude 0 (pad2 bit 24)
 float FoliageSwayAmp() { return L().swayAmp; }
 int FoliageSwayPhase() { const int v = L().swayPhase; return v < 0 ? 0 : v > 7 ? 7 : v; }
-int FoliageLeafDebugFlags() { return (L().leafFlip ? 16 : 0) | (L().leafDebug ? 32 : 0); }
+int FoliageLeafDebugFlags() { const int ps = MotionAaProbeState(); return (L().leafFlip ? 16 : 0) | ((L().leafDebug || (ps >= 0 && (ps & 16))) ? 32 : 0); }
 
 // ---- hashed alpha / alpha to coverage (SPIR-V wrapper, like PatchAlphaTest in nvn_alpha.cpp) --------------------------------
 namespace {
@@ -92,7 +98,7 @@ uint32_t FBits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 // give d = dot(forward, toLight); looking toward the sun (d > -0.35) the lit colour is multiplied by 1 + gain * ((d+0.35)/1.35)^2 * tint (warm: red kept,
 // green 0.9, blue 0.35), as sunlight showing through the leaf. Modules without those two constant buffers (or the GLSL.std450 import) get no leaf term.
 // Returns false when the module is not of the expected shape (the caller then keeps the game's own hard test).
-bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool hash, int leaf, std::vector<uint32_t>& out) {
+bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool hash, int leaf, std::vector<uint32_t>& out, uint32_t covVar) {
   if (func != 2 && func != 4 && func != 5 && func != 7) return false;
   if (in.size() < 6 || in[0] != 0x07230203) return false;
   const uint32_t bound = in[3];
@@ -155,15 +161,16 @@ bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool ha
   const int leafLvl = leaf & 15;   // 1..8 gain, 9 = debug (red)
   const bool doLeaf = leafLvl > 0 && cam && light && glslSet && intT;
   const bool addUPtr = doLeaf && !uPtrF;
-  if (!hash && !doLeaf) return false;
+  if (!hash && !doLeaf && !covVar) return false;
 
   uint32_t next = bound;
   auto nid = [&]() { return next++; };
   const uint32_t refId = nid(), newMain = nid(), lbl = nid(), callId = nid(), loadId = nid(), aId = nid(), dId = nid(), wId = nid(), weId = nid(), qId = nid(), sId = nid(),
                  fcId = nid(), xId = nid(), yId = nid(), txId = nid(), tyId = nid(), tId = nid(), f1Id = nid(), mId = nid(), hId = nid(), condId = nid(), killLbl = nid(),
                  mergeLbl = nid(), cHalf = nid(), cEps = nid(), cOne = nid(), cK1 = nid(), cK2 = nid(), cK3 = nid(), nvId = nid();
-  const bool addBool = !boolT && !a2c;
+  const bool addBool = !boolT && (!a2c || covVar);
   if (addBool) boolT = nid();
+  const uint32_t cCovQ = covVar ? nid() : 0, cCovZ = covVar ? nid() : 0;
   const bool addPtr = addFc && !inPtr;
   if (addPtr) inPtr = nid();
   if (addFc) fcVar = nid();
@@ -204,6 +211,11 @@ bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool ha
   Emit(out, kOpConstant, {floatT, cK1, FBits(0.06711056f)});
   Emit(out, kOpConstant, {floatT, cK2, FBits(0.00583715f)});
   Emit(out, kOpConstant, {floatT, cK3, FBits(52.9829189f)});
+  if (covVar) {
+    static const float q = [] { const char* e = getenv("SNAP_FOLIAGE_STABLE_K"); const float v = e && *e ? (float)atof(e) : 0.25f; return v < 0 ? 0.0f : v > 2 ? 2.0f : v; }();
+    Emit(out, kOpConstant, {floatT, cCovQ, FBits(q)});
+    Emit(out, kOpConstant, {floatT, cCovZ, FBits(0.0f)});
+  }
   if (doLeaf) {
     Emit(out, kOpConstant, {intT, cI0, 0});
     Emit(out, kOpConstant, {intT, cI1, 1});
@@ -223,6 +235,17 @@ bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool ha
   Emit(out, kOpFunctionCall, {voidT, callId, entry});
   Emit(out, kOpLoad, {vecT, loadId, var0});
   Emit(out, kOpCompositeExtract, {floatT, aId, loadId, 3});
+  uint32_t aUse = aId;
+  if (covVar) {
+    const uint32_t lod = nid(), gt = nid(), lm = nid(), t = nid(), sc = nid(), a2 = nid();
+    Emit(out, kOpLoad, {floatT, lod, covVar});
+    Emit(out, kOpFOrdGreaterThan, {boolT, gt, lod, cCovZ});
+    Emit(out, 169 /*OpSelect*/, {floatT, lm, gt, lod, cCovZ});
+    Emit(out, kOpFMul, {floatT, t, lm, cCovQ});
+    Emit(out, kOpFAdd, {floatT, sc, t, cOne});
+    Emit(out, kOpFMul, {floatT, a2, aId, sc});
+    aUse = a2;
+  }
   uint32_t colId = loadId;   // the colour vector the final store writes (leaf term applied below)
   auto emitLeaf = [&]() {
     uint32_t pc[6], ld[6];
@@ -259,8 +282,8 @@ bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool ha
     colId = cur;
   };
   if (hash) {
-    if (func == 5 || func == 7) Emit(out, kOpFSub, {floatT, dId, aId, refId}); else Emit(out, kOpFSub, {floatT, dId, refId, aId});
-    Emit(out, kOpFwidth, {floatT, wId, aId});
+    if (func == 5 || func == 7) Emit(out, kOpFSub, {floatT, dId, aUse, refId}); else Emit(out, kOpFSub, {floatT, dId, refId, aUse});
+    Emit(out, kOpFwidth, {floatT, wId, aUse});
     const uint32_t wsId = nid();   // half width ramp: fewer dithered pixels, the edge still gets a graded step
     Emit(out, kOpFMul, {floatT, wsId, wId, cHalf});
     Emit(out, kOpFAdd, {floatT, weId, wsId, cEps});
@@ -292,18 +315,96 @@ bool PatchAlphaHash(const std::vector<uint32_t>& in, int func, bool a2c, bool ha
     }
   } else {   // leaf term only: the game's own hard test, then the term
     const uint32_t cmp = func == 5 ? (uint32_t)kOpFOrdGreaterThan : func == 7 ? 190u : func == 2 ? 184u : 188u;
-    Emit(out, cmp, {boolT, condId, aId, refId});
+    Emit(out, cmp, {boolT, condId, aUse, refId});
     Emit(out, kOpSelectionMerge, {mergeLbl, 0});
     Emit(out, kOpBranchConditional, {condId, mergeLbl, killLbl});
     Emit(out, kOpLabel, {killLbl});
     Emit(out, kOpKill, {});
     Emit(out, kOpLabel, {mergeLbl});
-    emitLeaf();
-    Emit(out, kOpStore, {var0, colId});
+    if (doLeaf) { emitLeaf(); Emit(out, kOpStore, {var0, colId}); }
     Emit(out, kOpReturn, {});
   }
   Emit(out, kOpFunctionEnd, {});
   out[3] = next;
+  return true;
+}
+
+// Foliage stability: OpImageQueryLod after the first 2D implicit-lod sample, its .x (the mip level read, after clamping to the texture's mips and the
+// sampler's bias) stored into a new Private float (initialised to 0, so a module whose sample sits in a branch that did not run reads level 0).
+bool PatchCaptureAlphaLod(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint32_t* lodVar) {
+  if (in.size() < 6 || in[0] != 0x07230203) return false;
+  const uint32_t version = in[1];
+  uint32_t floatT = 0, vec2T = 0, privPtr = 0, firstFn = 0, entryAt = 0;
+  bool hasCap = false;
+  std::map<uint32_t, uint32_t> typeOf;
+  std::map<uint32_t, uint32_t> sampledImgT, img2d;
+  std::vector<std::pair<size_t, uint32_t>> cands;
+  std::set<uint32_t> alphaRead;
+  size_t sampleAt = 0;
+  size_t i = 5;
+  while (i < in.size()) {
+    const uint32_t wc = in[i] >> 16, op = in[i] & 0xFFFF;
+    if (!wc || i + wc > in.size()) return false;
+    if (op == kOpCompositeExtract && wc == 5 && in[i + 4] == 3) alphaRead.insert(in[i + 3]);
+    if (op == 79 && wc >= 6) for (size_t c = 5; c < wc; c++) { if (in[i + c] == 3) alphaRead.insert(in[i + 3]); if (in[i + c] == 7) alphaRead.insert(in[i + 4]); }
+    switch (op) {
+      case 17: if (in[i + 1] == 50) hasCap = true; break;   // OpCapability ImageQuery
+      case kOpEntryPoint: if (in[i + 1] == 4 && !entryAt) entryAt = (uint32_t)i; break;
+      case kOpTypeFloat: if (in[i + 2] == 32 && !floatT) floatT = in[i + 1]; break;
+      case kOpTypeVector: if (floatT && in[i + 2] == floatT && in[i + 3] == 2 && !vec2T) vec2T = in[i + 1]; break;
+      case kOpTypePointer: if (floatT && in[i + 2] == 6 && in[i + 3] == floatT && !privPtr) privPtr = in[i + 1]; break;
+      case 25: img2d[in[i + 1]] = (in[i + 3] == 1 && in[i + 5] == 0 && in[i + 6] == 0) ? 1u : 0u; break;   // OpTypeImage: Dim 2D, Arrayed 0, MS 0
+      case 27: sampledImgT[in[i + 1]] = in[i + 2]; break;   // OpTypeSampledImage
+      case kOpFunction: if (!firstFn) firstFn = (uint32_t)i; break;
+      case kOpLoad: case 79: case 80: case kOpCompositeExtract: case 86: case kOpFAdd: case kOpFSub: case kOpFMul: case 142: case 12: case 169:
+        if (firstFn && wc >= 3) typeOf[in[i + 2]] = in[i + 1];
+        break;
+      case 87:   // OpImageSampleImplicitLod
+        if (firstFn && wc >= 5) {
+          auto si = typeOf.find(in[i + 3]); auto co = typeOf.find(in[i + 4]);
+          if (si != typeOf.end() && co != typeOf.end() && vec2T && co->second == vec2T) {
+            auto st = sampledImgT.find(si->second);
+            if (st != sampledImgT.end()) { auto im = img2d.find(st->second); if (im != img2d.end() && im->second) cands.push_back({i, in[i + 2]}); }
+          }
+        }
+        break;
+      default: break;
+    }
+    i += wc;
+  }
+  for (auto& c : cands) if (alphaRead.count(c.second)) { sampleAt = c.first; break; }
+  if (!sampleAt && !cands.empty()) sampleAt = cands[0].first;
+  if (!floatT || !firstFn || !sampleAt || !entryAt) return false;
+  uint32_t next = in[3];
+  const bool addVec2 = !vec2T; (void)addVec2;
+  const bool addPtr = !privPtr;
+  if (addPtr) privPtr = next++;
+  const uint32_t c0 = next++, var = next++, q = next++, l = next++;
+  out.assign(in.begin(), in.begin() + 5);
+  if (!hasCap) Emit(out, 17, {50});
+  size_t k = 5;
+  while (k < firstFn) {
+    const uint32_t wc = in[k] >> 16;
+    const size_t base = out.size();
+    out.insert(out.end(), in.begin() + k, in.begin() + k + wc);
+    if (k == entryAt && version >= 0x10400) { out.push_back(var); out[base] = ((uint32_t)(wc + 1) << 16) | kOpEntryPoint; }
+    k += wc;
+  }
+  if (addPtr) Emit(out, kOpTypePointer, {privPtr, 6, floatT});
+  Emit(out, kOpConstant, {floatT, c0, FBits(0.0f)});
+  Emit(out, kOpVariable, {privPtr, var, 6, c0});
+  while (k < in.size()) {
+    const uint32_t wc = in[k] >> 16;
+    out.insert(out.end(), in.begin() + k, in.begin() + k + wc);
+    if (k == sampleAt) {
+      Emit(out, 105 /*OpImageQueryLod*/, {vec2T, q, in[k + 3], in[k + 4]});
+      Emit(out, kOpCompositeExtract, {floatT, l, q, 0});
+      Emit(out, kOpStore, {var, l});
+    }
+    k += wc;
+  }
+  out[3] = next;
+  *lodVar = var;
   return true;
 }
 
@@ -479,7 +580,10 @@ uint32_t FoliagePipeBits(int alphaFunc, float alphaRef, int32_t colorVkFmt, int3
   if (nColor < 1) {   // the scene's colour-less depth pre-pass (reverse Z, GEQUAL, writes depth): the colour pass tests against its depth with GEQUAL, so it must move with the sway or the leaves z-fight themselves
     if (!depthWrite || depthFunc != 7 || FxIsPhotoFrame()) return 0;
     const int sw = (int)(FoliageSwayStrength() * 8.0f + 0.5f);
-    return sw > 0 ? (((uint32_t)sw << 17) | ((uint32_t)FoliageSwayPhase() << 21) | (FoliageSwayZero() ? 1u << 24 : 0u) | (1u << 25)) : 0u;
+    const bool pre = alphaFunc != 0 && alphaRef >= 0.15f;
+    const uint32_t edge = (pre && FoliageAaEnabled() && FoliageAaPrepass() ? 1u : 0u) | (pre && FoliageStableEnabled() ? 4u : 0u);
+    if (edge) FxNoteRan();
+    return (sw > 0 ? (((uint32_t)sw << 17) | ((uint32_t)FoliageSwayPhase() << 21) | (FoliageSwayZero() ? 1u << 24 : 0u) | (1u << 25)) : 0u) | edge;
   }
   if (colorVkFmt != 97 /* VK_FORMAT_R16G16B16A16_SFLOAT */) return 0;
   if (alphaFunc == 0) {   // SNAP_WIND_ALL only: sway bits, no edge or leaf effects
@@ -492,7 +596,8 @@ uint32_t FoliagePipeBits(int alphaFunc, float alphaRef, int32_t colorVkFmt, int3
   const int dbg = FoliageLeafDebugFlags();
   const int leaf = (dbg & 32) ? 9 : (int)(FoliageLeafStrength() * 8.0f + 0.5f);
   const int sway = (int)(FoliageSwayStrength() * 8.0f + 0.5f);   // 0..8: wind sway level, pad2 bits 17..20
-  if (!aa && leaf <= 0 && sway <= 0) return 0;
+  const bool cov = FoliageStableEnabled();
+  if (!aa && leaf <= 0 && sway <= 0 && !cov) return 0;
   static std::atomic<int> s_photoKept{0}, s_ran{0};
   if (FxIsPhotoFrame()) {
     const int n = ++s_photoKept;
@@ -501,7 +606,7 @@ uint32_t FoliagePipeBits(int alphaFunc, float alphaRef, int32_t colorVkFmt, int3
   }
   ++s_ran;
   FxNoteRan();   // an effect variant is drawing this frame (A/B capture gating counters)
-  return (aa ? 1u : 0u) | ((uint32_t)std::min(leaf, 9) << 4) | ((dbg & 16) ? 2u : 0u) | ((uint32_t)sway << 17) | (sway > 0 ? ((uint32_t)FoliageSwayPhase() << 21) | (FoliageSwayZero() ? 1u << 24 : 0u) : 0u);   // bit 1 = debug flip (bits 8..16 belong to the parallax rows, 17..20 the wind sway level)
+  return (aa ? 1u : 0u) | (cov ? 4u : 0u) | ((uint32_t)std::min(leaf, 9) << 4) | ((dbg & 16) ? 2u : 0u) | ((uint32_t)sway << 17) | (sway > 0 ? ((uint32_t)FoliageSwayPhase() << 21) | (FoliageSwayZero() ? 1u << 24 : 0u) : 0u);   // bit 1 = debug flip (bits 8..16 belong to the parallax rows, 17..20 the wind sway level)
 }
 
 namespace {
@@ -521,6 +626,12 @@ float FoliageParticleBoost(const void* tex, uint32_t w, uint32_t h, uint32_t fmt
   static const int sel = [] { const char* e = getenv("SNAP_SOFT_PARTICLES_SEL"); return e && *e ? atoi(e) : 6; }();   // bit 0 = A, 1 = B, 2 = C: the particle pass draws into C + the depth of B (B's colour is the downsample's own output)
   if (!SoftParticlesEnabled() || !((lab == 'A' ? 1 : lab == 'B' ? 2 : 4) & sel)) return 1.0f;
   return 2.0f;
+}
+float FoliageParticleBoostLive(const void* tex, float created) {
+  char lab;
+  { std::lock_guard<std::mutex> g(g_lblMu); auto it = g_lbl.find(tex); if (it == g_lbl.end()) return created; lab = it->second; }
+  static const int sel = [] { const char* e = getenv("SNAP_SOFT_PARTICLES_SEL"); return e && *e ? atoi(e) : 6; }();
+  return SoftParticlesEnabled() && ((lab == 'A' ? 1 : lab == 'B' ? 2 : 4) & sel) ? 2.0f : 1.0f;
 }
 void FoliageTextureGone(const void* tex) { std::lock_guard<std::mutex> g(g_lblMu); g_lbl.erase(tex); }
 char FoliageTexLabel(const void* tex) {

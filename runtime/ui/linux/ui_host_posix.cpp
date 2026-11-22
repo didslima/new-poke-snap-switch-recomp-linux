@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +41,50 @@ namespace {
 #ifdef HLE_WITH_SDL3
 SDL_Window* g_window = nullptr;
 bool g_text_input_active = false;
+bool g_rel_mouse_active = false;
+bool g_mouse_grab_active = false;
+bool g_cursor_hidden_state = false;
+bool g_cursor_in_window = false;
+bool g_atexit_registered = false;
+double g_raw_mouse_carry_x = 0.0;
+double g_raw_mouse_carry_y = 0.0;
+
+void restore_os_cursor_at_exit() {
+  if (SDL_WasInit(SDL_INIT_VIDEO) != 0) {
+    if (g_window) {
+      SDL_SetWindowRelativeMouseMode(g_window, false);
+      SDL_SetWindowMouseGrab(g_window, false);
+    }
+    SDL_ShowCursor();
+  }
+}
+
+void update_posted_abs_pos(float px, float py) {
+  if (!g_window) return;
+  int ww = 0, wh = 0;
+  if (SDL_GetWindowSize(g_window, &ww, &wh) && ww > 0 && wh > 0) {
+    const float nx = px / static_cast<float>(ww);
+    const float ny = py / static_cast<float>(wh);
+    const bool in_win = (px >= 0.0f && py >= 0.0f && px < static_cast<float>(ww) && py < static_cast<float>(wh));
+    hle::input::post_mouse_pos(nx, ny, in_win);
+    static const bool dbg = std::getenv("SNAP_MOUSE_DEBUG") && std::atoi(std::getenv("SNAP_MOUSE_DEBUG")) != 0;
+    if (dbg) {
+      static int cnt = 0;
+      if ((cnt++ % 30) == 0) {
+        std::fprintf(stderr, "[mouse_dbg][sdl3] abs=(%.1f,%.1f) win=(%dx%d) norm=(%.3f,%.3f) in_win=%d\n",
+                     px, py, ww, wh, nx, ny, (int)in_win);
+      }
+    }
+  }
+}
+
+void flush_raw_mouse_deltas() {
+  g_raw_mouse_carry_x = 0.0;
+  g_raw_mouse_carry_y = 0.0;
+  float tx = 0.0f, ty = 0.0f;
+  hle::input::raw_mouse().take(&tx, &ty);
+  SDL_GetRelativeMouseState(nullptr, nullptr);
+}
 
 ImGuiKey sdl_key_to_imgui(SDL_Keycode key) {
   switch (key) {
@@ -136,10 +181,38 @@ void new_frame(ImGuiIO& io, float width, float height) {
       SDL_StopTextInput(g_window);
       g_text_input_active = false;
     }
-    if (hle::input::hub().cursor_hidden() && !ui_active) {
-      SDL_HideCursor();
-    } else {
-      SDL_ShowCursor();
+    bool want_lock = false, want_recenter = false;
+    hle::input::sdl3_cursor_mode(&want_lock, &want_recenter);
+    const bool focused = (SDL_GetKeyboardFocus() == g_window) &&
+                         ((SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) == 0);
+    const bool target_rel = !ui_active && focused && want_recenter;
+    const bool target_grab = !ui_active && focused && want_lock && !target_rel;
+    if (target_rel != g_rel_mouse_active) {
+      SDL_SetWindowRelativeMouseMode(g_window, target_rel);
+      g_rel_mouse_active = target_rel;
+      flush_raw_mouse_deltas();
+    }
+    if (target_grab != g_mouse_grab_active) {
+      SDL_SetWindowMouseGrab(g_window, target_grab);
+      g_mouse_grab_active = target_grab;
+    }
+    if (!g_atexit_registered) {
+      std::atexit(restore_os_cursor_at_exit);
+      g_atexit_registered = true;
+    }
+    static const bool hide_os_cursor_opt =
+        !(std::getenv("SNAP_HIDE_OS_CURSOR") && std::atoi(std::getenv("SNAP_HIDE_OS_CURSOR")) == 0);
+    const bool want_hide =
+        !ui_active && focused &&
+        (hle::input::hub().cursor_hidden() || target_rel || (hide_os_cursor_opt && g_cursor_in_window));
+    if (want_hide != g_cursor_hidden_state) {
+      if (want_hide) SDL_HideCursor(); else SDL_ShowCursor();
+      g_cursor_hidden_state = want_hide;
+      static const bool dbg = std::getenv("SNAP_MOUSE_DEBUG") && std::atoi(std::getenv("SNAP_MOUSE_DEBUG")) != 0;
+      if (dbg) {
+        std::fprintf(stderr, "[mouse_dbg][cursor] hide=%d rel=%d grab=%d ui_active=%d focused=%d\n",
+                     (int)want_hide, (int)target_rel, (int)target_grab, (int)ui_active, (int)focused);
+      }
     }
   }
 #endif
@@ -147,10 +220,18 @@ void new_frame(ImGuiIO& io, float width, float height) {
 
 void shutdown_platform() {
 #ifdef HLE_WITH_SDL3
-  if (g_window && g_text_input_active && SDL_WasInit(SDL_INIT_VIDEO) != 0) {
-    SDL_StopTextInput(g_window);
+  if (g_window && SDL_WasInit(SDL_INIT_VIDEO) != 0) {
+    if (g_text_input_active) SDL_StopTextInput(g_window);
+    SDL_SetWindowRelativeMouseMode(g_window, false);
+    SDL_SetWindowMouseGrab(g_window, false);
+    SDL_ShowCursor();
   }
   g_text_input_active = false;
+  g_rel_mouse_active = false;
+  g_mouse_grab_active = false;
+  g_cursor_hidden_state = false;
+  g_cursor_in_window = false;
+  flush_raw_mouse_deltas();
   g_window = nullptr;
 #endif
   g_initialized = false;
@@ -161,8 +242,14 @@ void release_cursor_confine() {
 #ifdef HLE_WITH_SDL3
   if (g_window && SDL_WasInit(SDL_INIT_VIDEO) != 0) {
     SDL_SetWindowRelativeMouseMode(g_window, false);
+    SDL_SetWindowMouseGrab(g_window, false);
     SDL_ShowCursor();
   }
+  g_rel_mouse_active = false;
+  g_mouse_grab_active = false;
+  g_cursor_hidden_state = false;
+  g_cursor_in_window = false;
+  flush_raw_mouse_deltas();
 #endif
 }
 
@@ -320,6 +407,7 @@ extern "C" void snap_ui_on_sdl_event(const void* sdl_event) {
 #ifdef HLE_WITH_SDL3
   if (!sdl_event) return;
   const auto* ev = static_cast<const SDL_Event*>(sdl_event);
+  const bool ui_active = snap::ui::overlay_open() || snap::ui::overlay_modal_active();
   switch (ev->type) {
     case SDL_EVENT_KEY_DOWN:
       if (!ev->key.repeat) {
@@ -337,25 +425,75 @@ extern "C" void snap_ui_on_sdl_event(const void* sdl_event) {
         }
       }
       break;
-    case SDL_EVENT_MOUSE_WHEEL:
-      hle::input::post_wheel(static_cast<int>(ev->wheel.y * 120.0f));
+    case SDL_EVENT_MOUSE_MOTION:
+      if (!ui_active && snap::ui::host::g_window && SDL_GetKeyboardFocus() == snap::ui::host::g_window) {
+        snap::ui::host::g_cursor_in_window = true;
+        snap::ui::host::update_posted_abs_pos(ev->motion.x, ev->motion.y);
+        snap::ui::host::g_raw_mouse_carry_x += static_cast<double>(ev->motion.xrel);
+        snap::ui::host::g_raw_mouse_carry_y += static_cast<double>(ev->motion.yrel);
+        const int dx = static_cast<int>(std::trunc(snap::ui::host::g_raw_mouse_carry_x));
+        const int dy = static_cast<int>(std::trunc(snap::ui::host::g_raw_mouse_carry_y));
+        snap::ui::host::g_raw_mouse_carry_x -= static_cast<double>(dx);
+        snap::ui::host::g_raw_mouse_carry_y -= static_cast<double>(dy);
+        if (dx != 0 || dy != 0) hle::input::post_raw_mouse(dx, dy);
+        static const bool dbg = std::getenv("SNAP_MOUSE_DEBUG") && std::atoi(std::getenv("SNAP_MOUSE_DEBUG")) != 0;
+        if (dbg && snap::ui::host::g_rel_mouse_active && (ev->motion.xrel != 0.0f || ev->motion.yrel != 0.0f)) {
+          const double ang_deg = std::atan2(-static_cast<double>(ev->motion.yrel), static_cast<double>(ev->motion.xrel)) * 57.2957795;
+          std::fprintf(stderr, "[mouse_dbg][sdl] ts_ns=%llu xrel=%.3f yrel=%.3f posted=(%d,%d) ang=%.1fdeg\n",
+                       (unsigned long long)ev->motion.timestamp, ev->motion.xrel, ev->motion.yrel, dx, dy, ang_deg);
+        }
+      }
+      break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+      if (!ui_active && snap::ui::host::g_window && SDL_GetKeyboardFocus() == snap::ui::host::g_window) {
+        snap::ui::host::update_posted_abs_pos(ev->button.x, ev->button.y);
+      }
+      break;
+    case SDL_EVENT_WINDOW_MOUSE_ENTER:
+      snap::ui::host::g_cursor_in_window = true;
+      break;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+      snap::ui::host::g_cursor_in_window = false;
+      if (snap::ui::host::g_cursor_hidden_state && !snap::ui::host::g_rel_mouse_active) {
+        SDL_ShowCursor();
+        snap::ui::host::g_cursor_hidden_state = false;
+      }
+      hle::input::post_mouse_pos(0.0f, 0.0f, false);
+      break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case SDL_EVENT_WINDOW_MINIMIZED:
+      snap::ui::host::release_cursor_confine();
+      break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+      snap::ui::host::flush_raw_mouse_deltas();
       break;
     default:
       break;
   }
 
-  if (!(snap::ui::overlay_open() || snap::ui::overlay_modal_active()) || !snap::ui::overlay_imgui_ready()) {
+  if (!ui_active || !snap::ui::overlay_imgui_ready()) {
     return;
   }
 
   std::lock_guard<std::recursive_mutex> lk(snap::ui::overlay_mutex());
   ImGuiIO& io = ImGui::GetIO();
   switch (ev->type) {
-    case SDL_EVENT_MOUSE_MOTION:
-      io.AddMousePosEvent(ev->motion.x, ev->motion.y);
+    case SDL_EVENT_MOUSE_MOTION: {
+      int ww = 0, wh = 0;
+      if (snap::ui::host::g_window) SDL_GetWindowSize(snap::ui::host::g_window, &ww, &wh);
+      float ix = ev->motion.x, iy = ev->motion.y;
+      snap::ui::host::scale_window_pos_to_display(ev->motion.x, ev->motion.y, ww, wh, io.DisplaySize.x, io.DisplaySize.y, &ix, &iy);
+      io.AddMousePosEvent(ix, iy);
       break;
+    }
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
+      int ww = 0, wh = 0;
+      if (snap::ui::host::g_window) SDL_GetWindowSize(snap::ui::host::g_window, &ww, &wh);
+      float ix = ev->button.x, iy = ev->button.y;
+      snap::ui::host::scale_window_pos_to_display(ev->button.x, ev->button.y, ww, wh, io.DisplaySize.x, io.DisplaySize.y, &ix, &iy);
+      io.AddMousePosEvent(ix, iy);
       const int b = snap::ui::host::sdl_button_to_imgui(ev->button.button);
       if (b >= 0) io.AddMouseButtonEvent(b, ev->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
       break;

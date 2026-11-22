@@ -7,6 +7,7 @@
 //     modifying Cpu state, the lifted guest code executes its original unmodded Switch instructions.
 //   - None of them advertises mod support or registers host overrides via loader::add_override().
 //   - rt_drp_decrypt / rt_drp_decrypt_check are NOT stubbed here: they are provided by shared host/mods/drpfast.cpp.
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +27,12 @@
 extern "C" __attribute__((weak)) float nvnHostGetUltrawide(void) { return 1.0f; }
 extern "C" __attribute__((weak)) void nvnHostSetUiPresentAspect(float) {}
 extern "C" __attribute__((weak)) uint64_t snap_present_count(void) { return 0; }
+
+namespace hle::input {
+__attribute__((weak)) bool route_on() { return false; }
+__attribute__((weak)) void route_rail(uint64_t, float) {}
+__attribute__((weak)) void route_ui(uint64_t, const char *, const char *, int, const char *, uint64_t) {}
+}  // namespace hle::input
 
 namespace {
 
@@ -54,7 +61,10 @@ bool fov_trace_enabled() {
     return on;
 }
 
+std::atomic<bool> g_photodex_16_9{false};
+
 void wide_camera(Cpu *c, uint64_t off) {
+    if (g_photodex_16_9.load(std::memory_order_acquire)) return;
     int reg = -1;
     bool is_cutscene = false;
     for (int i = 0; i < g_wide_nsites; i++) if (g_wide_sites[i].off == off) { reg = g_wide_sites[i].reg; break; }
@@ -253,6 +263,7 @@ void enter_post_ride_16_9(PostRideState &st, const char *trigger, int ev, uint64
 }
 
 void on_ride_tick() {
+    g_photodex_16_9.store(false, std::memory_order_relaxed);
     PostRideState &st = post_ride_state();
     const uint64_t now = snap_present_count();
     std::lock_guard<std::mutex> lock(st.mu);
@@ -279,6 +290,30 @@ void on_dialogue_wait() {
 }
 
 void update_post_ride_16_9_aspect(const char *scene, int ev) {
+    if (std::strncmp(scene, "zukan", 5) == 0) {
+        if (ev == 2 || ev == -1) {
+            if (!g_photodex_16_9.exchange(true, std::memory_order_acq_rel)) {
+                nvnHostSetUiPresentAspect(16.0f / 9.0f);
+            }
+            return;
+        }
+        if (ev == 3 && g_photodex_16_9.exchange(false, std::memory_order_acq_rel)) {
+            PostRideState &st = post_ride_state();
+            std::lock_guard<std::mutex> lock(st.mu);
+            if (st.phase != PostRidePhase::PostRide16_9) nvnHostSetUiPresentAspect(0.0f);
+            return;
+        }
+    } else if (g_photodex_16_9.load(std::memory_order_acquire) &&
+               (std::strcmp(scene, "loading") == 0 ||
+                (std::strcmp(scene, "main_menu") == 0 && ev == 2) ||
+                (std::strcmp(scene, "map_select") == 0 && (ev == 2 || ev == -1)) ||
+                (std::strcmp(scene, "title") == 0 && ev == 2))) {
+        g_photodex_16_9.store(false, std::memory_order_release);
+        PostRideState &st = post_ride_state();
+        std::lock_guard<std::mutex> lock(st.mu);
+        if (st.phase != PostRidePhase::PostRide16_9) nvnHostSetUiPresentAspect(0.0f);
+    }
+
     PostRideState &st = post_ride_state();
     const uint64_t now = snap_present_count();
     std::lock_guard<std::mutex> lock(st.mu);
@@ -401,7 +436,12 @@ void rt_gm_font_atlas_dims(Cpu *) {}
 void rt_gm_font_glyph1(Cpu *) {}
 void rt_gm_font_glyph2(Cpu *) {}
 void rt_gm_font_fix(Cpu *) {}
-void rt_gm_neo_speed(Cpu *) { on_ride_tick(); }
+void rt_gm_neo_speed(Cpu *c) {
+    on_ride_tick();
+    if (c && hle::input::route_on() && ptr_plausible(c->x[19] + 0x70)) {
+        hle::input::route_rail(c->x[19], *reinterpret_cast<const float *>(c->x[19] + 0x70));
+    }
+}
 void rt_gm_film_c(Cpu *) {}
 void rt_gm_skip_wait(Cpu *) { on_dialogue_wait(); }
 void rt_gm_route_ui_event(Cpu *c) {
@@ -415,6 +455,7 @@ void rt_gm_route_ui_event(Cpu *c) {
     char nm[48]{};
     read_player_name(player, nm, sizeof(nm));
     update_post_ride_16_9_aspect(nm, ev);
+    if (hle::input::route_on()) hle::input::route_ui(player, nm, st, ev, "", c->x[30]);
     if (ui_trace_enabled()) log_ui_transition("event", player, nm, st, ev);
 }
 void rt_gm_route_ui_setstate(Cpu *c) {
@@ -426,6 +467,7 @@ void rt_gm_route_ui_setstate(Cpu *c) {
     char nm[48]{};
     read_player_name(player, nm, sizeof(nm));
     update_post_ride_16_9_aspect(nm, -1);
+    if (hle::input::route_on()) hle::input::route_ui(player, nm, st, -1, "", c->x[30]);
     if (ui_trace_enabled()) log_ui_transition("setstate", player, nm, st, -1);
 }
 // rt_gm_ui_enter, rt_gm_ui_event, rt_gm_ui_pad and rt_gm_ui_pointer are provided by host/mods/uipace.cpp.

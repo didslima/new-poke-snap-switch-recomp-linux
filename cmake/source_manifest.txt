@@ -98,6 +98,7 @@ windows  host/mods/shiny.cpp   # #include <windows.h>
 windows  host/mods/skips.cpp   # #include <windows.h>
 windows  host/mods/texdump.cpp   # #include <windows.h>, CreateFileW, DWORD ...
 shared   host/mods/uipace.cpp   # interface/pad/pointer pacing above 60 fps (uipace_core.h)
+shared   host/mods/ride_mouse_cam.cpp   # QA26 AOT Ride camera direct mouse-look hook
 windows  host/pgo.cpp   # #include <windows.h>, CreateThread, DWORD ...
 windows  host/portable.cpp   # #include <windows.h>, DWORD, GetEnvironmentVariableW ...
 windows  host/shaderprep.cpp   # #include <dxgi.h>, #include <windows.h>, BOOL ...
@@ -131,6 +132,7 @@ windows  runtime/nvn/nvn_freecam.cpp   # #include <wincodec.h>, #include <window
 shared   runtime/nvn/nvn_fx.cpp
 shared   runtime/nvn/nvn_gfx.cpp
 shared   runtime/nvn/nvn_gtao.cpp
+shared   runtime/nvn/nvn_hdfx.cpp
 windows  runtime/nvn/nvn_hdphoto.cpp   # #include <wincodec.h>, #include <windows.h>, CoCreateInstance ...
 shared   runtime/nvn/nvn_hdr.cpp   # portable Vulkan HDR10/scRGB swapchain and presentation pass
 windows  runtime/nvn/nvn_hdr_win32.cpp   # DXGI display-peak query for HDR output metadata
@@ -138,6 +140,7 @@ linux    runtime/nvn/linux/nvn_hdr_posix.cpp   # queries SDL3 window HDR propert
 shared   runtime/nvn/nvn_hud.cpp
 shared   runtime/nvn/nvn_lens_fx.cpp
 shared   runtime/nvn/nvn_life.cpp
+shared   runtime/nvn/nvn_motionaa.cpp
 shared   runtime/nvn/nvn_lighting_fx.cpp
 shared   runtime/nvn/nvn_model.cpp
 shared   runtime/nvn/nvn_ocean.cpp

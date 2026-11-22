@@ -135,6 +135,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export LD_LIBRARY_PATH="${HERE}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export NVN_CACHE_DIR="${NVN_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/SnapRecomp/nvn_cache}"
+export SNAP_CUTSCENE_ULTRAWIDE="${SNAP_CUTSCENE_ULTRAWIDE:-1}"
 exec "${HERE}/usr/bin/snap_boot_linux" "$@"
 EOF
 chmod 755 "${APP_DIR}/AppRun"

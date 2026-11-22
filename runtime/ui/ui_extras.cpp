@@ -110,11 +110,47 @@ void extras_controller() {
   if (ImGui::Checkbox(tr("Invert gyro X"), &ix)) st::set_bool("gyro_invert_x", ix);
   ImGui::SameLine();
   if (ImGui::Checkbox(tr("Invert gyro Y"), &iy)) st::set_bool("gyro_invert_y", iy);
+  float gsm = st::get_float("gyro_smooth", 0.0f);
+  ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+  if (ImGui::SliderFloat(tr("Gyro smoothing"), &gsm, 0.0f, 1.0f, gsm <= 0.001f ? tr("Off") : "%.2f")) st::set_float("gyro_smooth", gsm);
+  float gdz = st::get_float("gyro_dead", 1.5f);
+  ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+  if (ImGui::SliderFloat(tr("Gyro dead zone (deg/s)"), &gdz, 0.0f, 6.0f, "%.1f")) st::set_float("gyro_dead", gdz);
+  bool gavg = st::get_bool("gyro_avg", false);
+  if (ImGui::Checkbox(tr("Average gyro samples between frames"), &gavg)) st::set_bool("gyro_avg", gavg);
   ImGui::EndDisabled();
   hle::input::RawInput r = hle::input::hub().raw();
   if (r.gyro_present) ImGui::TextColored(t.text_dim, tr("Gyro: %.0f, %.0f deg/s"), r.gyro_x, r.gyro_y);
   else ImGui::TextColored(t.text_dim, "%s", tr("Gyro: none reported (turn gyro aim on with a controller that has one)"));
   ImGui::TextColored(t.text_dim, "%s", tr("Applies at once."));
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextColored(t.title, "%s", tr("Aim feel"));
+  {
+    static const char* const kCurves[] = {"linear", "classic", "precise"};
+    static const char* const kCurveLabels[] = {"Linear (default)", "Classic", "Precise"};
+    int cur = hle::input::stick_curve_from_name(st::get("stick_curve", "linear"));
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+    if (ImGui::BeginCombo(tr("Stick response"), tr(kCurveLabels[cur]))) {
+      for (int i = 0; i < 3; ++i) if (ImGui::Selectable(tr(kCurveLabels[i]), i == cur)) st::set("stick_curve", kCurves[i]);
+      ImGui::EndCombo();
+    }
+    float dz = st::get_float("stick_deadzone", -1.0f);
+    bool follow = dz < 0.0f;
+    if (ImGui::Checkbox(tr("Use the dead zone from the controls menu"), &follow)) st::set_float("stick_deadzone", follow ? -1.0f : 0.15f);
+    if (!follow) {
+      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+      if (ImGui::SliderFloat(tr("Stick dead zone"), &dz, 0.0f, 0.6f, "%.2f")) st::set_float("stick_deadzone", dz);
+    }
+    bool raw = st::get_bool("raw_mouse", false);
+    if (ImGui::Checkbox(tr("Raw mouse input"), &raw)) st::set_bool("raw_mouse", raw);
+    float mw = st::get_float("mouse_window_ms", 40.0f);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+    if (ImGui::SliderFloat(tr("Mouse response window (ms)"), &mw, 8.0f, 80.0f, "%.0f")) st::set_float("mouse_window_ms", mw);
+    ImGui::TextColored(t.text_dim, "%s", tr("Defaults match earlier versions. Applies at once."));
+  }
 
   ImGui::Spacing();
   ImGui::TextColored(t.title, "%s", tr("Rumble"));

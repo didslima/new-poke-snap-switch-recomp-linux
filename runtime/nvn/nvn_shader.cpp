@@ -14,12 +14,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
-#include <sstream>
 #include <mutex>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "nvn_aa.h"
@@ -223,6 +227,74 @@ void FreeStage(Host* h, StageProg& s) {
   s = StageProg{};
 }
 
+// In-memory memoization + background prefetch of translation-cache files (ported from upstream 911c61e).
+// SNAP_XCACHE_MEMO_MB=<n> caps the copy (default 256; 0 = read every file from disk); SNAP_XCACHE_PREFETCH=0 disables prefetch.
+struct XMemoEntry { std::vector<uint8_t> spv, js; };
+static std::mutex& g_xmMu = *new std::mutex;
+static auto& g_xm = *new std::unordered_map<std::string, std::shared_ptr<const XMemoEntry>>;
+static uint64_t g_xmBytes = 0;
+
+static uint64_t XMemoCapBytes() {
+  static const uint64_t cap = [] {
+    const char* e = std::getenv("SNAP_XCACHE_MEMO_MB");
+    const long long mb = (e && *e) ? std::atoll(e) : 256;
+    return mb > 0 ? static_cast<uint64_t>(mb) << 20 : 0ull;
+  }();
+  return cap;
+}
+
+static std::shared_ptr<const XMemoEntry> XMemoFind(const std::string& k) {
+  if (!XMemoCapBytes()) return nullptr;
+  std::lock_guard<std::mutex> l(g_xmMu);
+  auto it = g_xm.find(k);
+  return it == g_xm.end() ? nullptr : it->second;
+}
+
+static void XMemoPut(const std::string& k, const std::vector<uint8_t>& spvIn, const std::vector<uint8_t>& jsIn) {
+  const uint64_t cap = XMemoCapBytes();
+  if (!cap) return;
+  std::lock_guard<std::mutex> l(g_xmMu);
+  if (g_xm.count(k) || g_xmBytes + spvIn.size() + jsIn.size() > cap) return;
+  auto e = std::make_shared<XMemoEntry>();
+  e->spv = spvIn;
+  e->js = jsIn;
+  g_xmBytes += spvIn.size() + jsIn.size();
+  g_xm.emplace(k, std::move(e));
+}
+
+static void XMemoPrefetch(const std::string& cacheDir) {
+  static std::once_flag g_xmPrefetchOnce;
+  std::call_once(g_xmPrefetchOnce, [&]() {
+    const char* pf = std::getenv("SNAP_XCACHE_PREFETCH");
+    if (!XMemoCapBytes() || (pf && *pf == '0') || cacheDir.empty()) return;
+    std::thread([cacheDir] {
+      std::error_code ec;
+      std::vector<std::string> keys;
+      for (const auto& entry : std::filesystem::directory_iterator(cacheDir, ec)) {
+        if (ec || !entry.is_regular_file(ec)) continue;
+        const std::string fn = entry.path().filename().string();
+        if (fn.size() > 5 && fn.find('.') == fn.size() - 5 && fn.compare(fn.size() - 5, 5, ".json") == 0) {
+          keys.push_back(fn.substr(0, fn.size() - 5));
+        }
+      }
+      for (const std::string& k : keys) {
+        if (XMemoFind(k)) continue;
+        {
+          std::lock_guard<std::mutex> l(g_xmMu);
+          if (g_xmBytes >= XMemoCapBytes()) break;
+        }
+        const std::string b = cacheDir + nvn::os_host::path_sep() + k;
+        std::vector<uint8_t> spvBuf, jsBuf;
+        if (!ReadFile(b + ".spv", &spvBuf) || !ReadFile(b + ".json", &jsBuf)) continue;
+        if (spvBuf.size() < 20 || (spvBuf.size() & 3) != 0) continue;
+        JP jp{reinterpret_cast<const char*>(jsBuf.data()), reinterpret_cast<const char*>(jsBuf.data()) + jsBuf.size()};
+        J tmp;
+        if (jp.parse(tmp)) XMemoPut(k, spvBuf, jsBuf);
+      }
+    }).detach();
+  });
+}
+
 // SNAP_XLATE_AB test aid (see XlateAbVariant in nvn_internal.h): loads the same fragment program translated by the other revision
 // (SNAP_XLATE_AB_REV, cache dir SNAP_XLATE_AB_DIR) as StageProg::modAlt/spvAlt, with the same post-processing as the normal module.
 void LoadAbAlt(Host* h, const uint8_t* data, uint32_t dataSize, int stage, uint32_t codeOff, uint32_t constOff, bool eft, const std::string& baseKey, StageProg* sp) {
@@ -304,10 +376,18 @@ bool BuildStage(Host* h, const ShaderData& sd, StageProg* out) {
     std::vector<uint8_t>& js;
     J& m;
   } cacheCtx{h, data, dataSize, stage, constOff, codeOff, key, base, spvPath, jsonPath, spv, js, m};
+  XMemoPrefetch(h->cacheDir);
   const bool loaded = nvn::os_host::ensure_shader_cache_entry(
       h->cacheDir, key, constOff,
       [](void* p) {
         auto* c = static_cast<CacheCtx*>(p);
+        if (auto e = XMemoFind(c->key)) {
+          c->spv = e->spv;
+          c->js = e->js;
+          JP jp{reinterpret_cast<const char*>(c->js.data()), reinterpret_cast<const char*>(c->js.data()) + c->js.size()};
+          c->m = J();
+          if (jp.parse(c->m)) return true;
+        }
         if (!ReadFile(c->spvPath, &c->spv) || !ReadFile(c->jsonPath, &c->js)) return false;
         if (c->spv.size() < 20 || (c->spv.size() & 3) != 0) {
           LogError("bad shader cache entry %s (spv %zu bytes); retranslating", c->base.c_str(), c->spv.size());
@@ -315,7 +395,10 @@ bool BuildStage(Host* h, const ShaderData& sd, StageProg* out) {
         }
         JP jp{reinterpret_cast<const char*>(c->js.data()), reinterpret_cast<const char*>(c->js.data()) + c->js.size()};
         c->m = J();
-        if (jp.parse(c->m)) return true;
+        if (jp.parse(c->m)) {
+          XMemoPut(c->key, c->spv, c->js);
+          return true;
+        }
         LogError("bad shader manifest %s; retranslating", c->jsonPath.c_str());
         return false;
       },

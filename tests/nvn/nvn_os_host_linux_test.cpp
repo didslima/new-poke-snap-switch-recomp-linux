@@ -22,7 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <thread>
 #include <unistd.h>
@@ -482,6 +484,104 @@ void test_shader_harness_posix() {
   fs::remove_all(base, ec);
 }
 
+void test_shader_harness_server_posix() {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path base = fs::temp_directory_path() / ("snap_harness_srv_test_" + std::to_string(::getpid()));
+  fs::remove_all(base, ec);
+  CHECK(fs::create_directories(base, ec));
+
+  const fs::path pid_file = base / "srv.pid";
+  const fs::path req_log = base / "requests.log";
+  const fs::path mock_srv = base / "mock_harness.sh";
+  {
+    std::ofstream f(mock_srv, std::ios::binary | std::ios::trunc);
+    f << "#!/usr/bin/env bash\n"
+      << "if [[ \"${1:-}\" != \"--nvn-serve\" ]]; then exit 1; fi\n"
+      << "echo \"$$\" >> \"" << pid_file.string() << "\"\n"
+      << "while IFS=$'\\t' read -r bin spv js st co code; do\n"
+      << "  echo \"$bin|$st|$co|$code\" >> \"" << req_log.string() << "\"\n"
+      << "  if [[ \"$bin\" == *reject* ]]; then\n"
+      << "    echo -e \"err\\tsynthetic reject\"\n"
+      << "  elif [[ \"$bin\" == *crash* ]]; then\n"
+      << "    exit 1\n"
+      << "  else\n"
+      << "    echo \"spv\" > \"$spv\"\n"
+      << "    echo '{\"stage\":0}' > \"$js\"\n"
+      << "    echo \"ok\"\n"
+      << "  fi\n"
+      << "done\n";
+    CHECK(static_cast<bool>(f));
+  }
+  CHECK(::chmod(mock_srv.c_str(), 0755) == 0);
+
+  const std::string launch = "\"" + mock_srv.string() + "\"";
+  const fs::path bin1 = base / "s1.bin";
+  const fs::path spv1 = base / "s1.spv";
+  const fs::path js1 = base / "s1.json";
+  const fs::path bin2 = base / "s2.bin";
+  const fs::path spv2 = base / "s2.spv";
+  const fs::path js2 = base / "s2.json";
+  CHECK(nvn::os_host::write_file_bytes(bin1.string(), "abc", 3));
+  CHECK(nvn::os_host::write_file_bytes(bin2.string(), "def", 3));
+
+  // 1-2. Start persistent server and translate two consecutive shaders in the same session.
+  bool ok = false;
+  CHECK(nvn::os_host::run_shader_harness_server(launch, bin1.string(), spv1.string(), js1.string(), 0, 128, 0, &ok));
+  CHECK(ok);
+  ok = false;
+  CHECK(nvn::os_host::run_shader_harness_server(launch, bin2.string(), spv2.string(), js2.string(), 1, 256, 48, &ok));
+  CHECK(ok);
+
+  // Verify only ONE server PID was spawned for both requests.
+  std::vector<uint8_t> pid_bytes;
+  CHECK(nvn::os_host::read_file_bytes(pid_file.string(), &pid_bytes));
+  const std::string pid_str(pid_bytes.begin(), pid_bytes.end());
+  int pid_lines = 0;
+  for (char c : pid_str) if (c == '\n') ++pid_lines;
+  CHECK(pid_lines == 1);
+  const pid_t first_pid = static_cast<pid_t>(std::atoi(pid_str.c_str()));
+  CHECK(first_pid > 0);
+
+  // 3. Explicit shader rejection returns handled=true, out_ok=false without killing the server.
+  const fs::path rej_bin = base / "reject.bin";
+  const fs::path rej_spv = base / "reject.spv";
+  const fs::path rej_js = base / "reject.json";
+  CHECK(nvn::os_host::write_file_bytes(rej_bin.string(), "x", 1));
+  ok = true;
+  CHECK(nvn::os_host::run_shader_harness_server(launch, rej_bin.string(), rej_spv.string(), rej_js.string(), 0, 0, 0, &ok));
+  CHECK(!ok);
+
+  // 4. Crash recovery: server exits unexpectedly -> returns false (Unavailable) so caller falls back; next request restarts server.
+  const fs::path crash_bin = base / "crash.bin";
+  const fs::path crash_spv = base / "crash.spv";
+  const fs::path crash_js = base / "crash.json";
+  CHECK(nvn::os_host::write_file_bytes(crash_bin.string(), "y", 1));
+  ok = true;
+  CHECK(!nvn::os_host::run_shader_harness_server(launch, crash_bin.string(), crash_spv.string(), crash_js.string(), 0, 0, 0, &ok));
+  CHECK(!ok);
+
+  ok = false;
+  CHECK(nvn::os_host::run_shader_harness_server(launch, bin1.string(), spv1.string(), js1.string(), 0, 128, 0, &ok));
+  CHECK(ok);
+
+  // 5. Missing/non-server binary falls back cleanly (handled=false, out_ok=false) and stops prior server cleanly (no orphan).
+  const std::string missing_launch = "\"" + (base / "does_not_exist").string() + "\"";
+  ok = true;
+  CHECK(!nvn::os_host::run_shader_harness_server(missing_launch, bin1.string(), spv1.string(), js1.string(), 0, 0, 0, &ok));
+  CHECK(!ok);
+
+  // Wait briefly and verify prior server PIDs are gone.
+  for (int i = 0; i < 50; ++i) {
+    if (::kill(first_pid, 0) != 0 && errno == ESRCH) break;
+    struct timespec ts{0, 10 * 1000 * 1000};
+    ::nanosleep(&ts, nullptr);
+  }
+  CHECK(::kill(first_pid, 0) != 0 && errno == ESRCH);
+
+  fs::remove_all(base, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -497,6 +597,7 @@ int main() {
   test_pacing_helpers();
   test_vulkan_surface_and_upscale_stubs();
   test_shader_harness_posix();
+  test_shader_harness_server_posix();
   std::printf("nvn_os_host_linux_test: %d checks, %d failed\n", g_checks, g_fails);
   return g_fails == 0 ? 0 : 1;
 }

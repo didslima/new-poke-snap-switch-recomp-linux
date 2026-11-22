@@ -376,15 +376,18 @@ VkPipeline CreateGraphicsPipelineImpl(Host* h, const PipeDesc& pd, StageProg* co
       const bool foliageHash = alpha && (pd.pad2 & 1) != 0;   // SNAP_FOLIAGE_AA: dithered edge (0x200) or alpha-to-coverage output (0x400, multisampled targets)
       const bool foliageA2c = foliageHash && pd.samples > 1;
       const int foliageLeaf = alpha ? (int)(((pd.pad2 >> 4) & 15u) | (((pd.pad2 >> 1) & 1u) << 4)) : 0;   // SNAP_LEAF_TRANSLUCENCY level 0..8 (vkey bits 11..14)
+      const bool foliageCov = alpha && (pd.pad2 & 4u) != 0;   // SNAP_FOLIAGE_STABLE: alpha scaled with the mip level (vkey bit 49)
       const uint64_t vkey = (uint64_t)((uint32_t)(alpha ? af : 0) | ((uint32_t)pd.nColor << 4) | (dual ? 0x100u : 0u) | intKindBits | (useAlt ? 0x80000000u : 0u) | ((uint32_t)pcfTaps << 16) |
-                            (foliageHash ? (foliageA2c ? 0x400u : 0x200u) : 0u) | ((uint32_t)foliageLeaf << 11)) | ((uint64_t)rtRays << 32) | ((uint64_t)((pd.pad2 >> 8) & 0x1FFu) << 40);
+                            (foliageHash ? (foliageA2c ? 0x400u : 0x200u) : 0u) | ((uint32_t)foliageLeaf << 11)) | ((uint64_t)rtRays << 32) | ((uint64_t)((pd.pad2 >> 8) & 0x1FFu) << 40) | (foliageCov ? (1ull << 49) : 0ull);
       std::lock_guard<std::mutex> fl(fragMu);
       auto it = fp.fragMods.find(vkey);
       if (it == fp.fragMods.end()) {
         std::vector<uint32_t> cur = useAlt ? fp.spvAlt : fp.spv, tmp;
         bool alphaOk = false;
         if (alpha) {
-          if ((foliageHash || foliageLeaf) && PatchAlphaHash(cur, af, foliageA2c, foliageHash, foliageLeaf, tmp)) { cur = tmp; alphaOk = true; }
+          uint32_t lodVar = 0;
+          if (foliageCov && PatchCaptureAlphaLod(cur, tmp, &lodVar)) cur = tmp;
+          if ((foliageHash || foliageLeaf || lodVar) && PatchAlphaHash(cur, af, foliageA2c, foliageHash, foliageLeaf, tmp, lodVar)) { cur = tmp; alphaOk = true; }
           else if (PatchAlphaTest(cur, af, tmp)) { cur = tmp; alphaOk = true; }
           else LogError("alpha test (func %d): fragment shader has no float vec4 output at location 0, test ignored", af);
         }

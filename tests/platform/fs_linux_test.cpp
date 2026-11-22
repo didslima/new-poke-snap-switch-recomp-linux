@@ -6,17 +6,22 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "hle/fs_core.h"
 #include "hle/hle.h"
+#include "hle/hle_config.h"
 #include "hle/hle_host.h"
 #include "hle/svc_common.h"
 
@@ -283,9 +288,194 @@ static void test_fs_registry_and_shims() {
     hle::fs::instance().unmount("rom");
 }
 
+static void put_save(hle::fs::Fs& f, const std::string& p, const std::string& s) {
+    uint32_t cr = f.create_file(p, static_cast<int64_t>(s.size()));
+    CHECK(cr == 0u || cr == hle::fs::kResultPathAlreadyExists);
+    hle::fs::FileId id = 0;
+    CHECK(f.open_file(&id, p, hle::fs::kModeRead | hle::fs::kModeWrite) == 0u);
+    CHECK(f.set_file_size(id, static_cast<int64_t>(s.size())) == 0u);
+    CHECK(f.write_file(id, 0, s.data(), s.size(), true) == 0u);
+    CHECK(f.close_file(id) == 0u);
+}
+
+static bool get_save(hle::fs::Fs& f, const std::string& p, std::string* out) {
+    hle::fs::FileId id = 0;
+    if (f.open_file(&id, p, hle::fs::kModeRead) != 0u) return false;
+    int64_t sz = 0;
+    CHECK(f.get_file_size(id, &sz) == 0u);
+    out->assign(static_cast<size_t>(sz), '\0');
+    size_t got = 0;
+    if (sz > 0) CHECK(f.read_file(id, 0, out->data(), static_cast<size_t>(sz), &got) == 0u);
+    CHECK(f.close_file(id) == 0u);
+    return true;
+}
+
+static std::string slurp_file(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static uint64_t read_current_gen(const fs::path& ud) {
+    std::ifstream f(ud / "CURRENT");
+    std::string magic;
+    uint64_t g = 0;
+    f >> magic >> g;
+    return g;
+}
+
+static std::set<std::string> gen_files(const fs::path& dir) {
+    std::set<std::string> out;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        out.insert(e.path().filename().string());
+    }
+    return out;
+}
+
+template <class Fn>
+static bool run_side_held(std::thread& t, std::atomic<bool>& done, Fn fn, int wait_ms = 60) {
+    done.store(false);
+    t = std::thread([&done, fn = std::move(fn)]() mutable {
+        fn();
+        done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+    return done.load();
+}
+
+static void test_save_commit_concurrent_ops() {
+    TempDir tmp;
+    const uint64_t uid[2] = {0x1122334455667788ull, 0x99aabbccddeeff00ull};
+    const fs::path root = tmp.path / "save_conc";
+    const fs::path ud = root / hle::uid_dir_name(uid);
+    const std::string a = "savedata:/A", b = "savedata:/B", c = "savedata:/C",
+                      d = "savedata:/D", e = "savedata:/E", g = "savedata:/G",
+                      sv = "savedata:/save.dat", bak = "savedata:/save.bak";
+    std::string body;
+
+    {
+        hle::fs::Fs f;
+        f.set_save_root(root.string());
+        CHECK(f.mount_save("savedata", uid) == 0u);
+        put_save(f, a, "AAAA");
+        put_save(f, d, "DDDD");
+        CHECK(f.commit("savedata") == 0u);
+
+        put_save(f, b, "BBBB");
+        put_save(f, e, "EEEE");
+
+        bool ran_carried = false, ran_done = false, side1_early = true, side2_early = true;
+        std::thread t1, t2;
+        std::atomic<bool> d1{false}, d2{false};
+        uint32_t rc1 = 1, rc1b = 1, rc2 = 1;
+        f.set_fault_hook([&](const char* s) {
+            if (!std::strcmp(s, "commit:carried") && !ran_carried) {
+                ran_carried = true;
+                put_save(f, b, "B2B2");  // data write runs concurrently with commit
+                side1_early = run_side_held(t1, d1, [&] {
+                    rc1 = f.delete_file(a);
+                    rc1b = f.create_file(c, 4);
+                });
+            }
+            if (!std::strcmp(s, "commit:files-done") && !ran_done) {
+                ran_done = true;
+                side2_early = run_side_held(t2, d2, [&] {
+                    rc2 = f.delete_file(e);
+                });
+            }
+        });
+        CHECK(f.commit("savedata") == 0u);
+        f.set_fault_hook(nullptr);
+        t1.join();
+        t2.join();
+        CHECK(rc1 == 0u && rc1b == 0u && rc2 == 0u);
+        put_save(f, c, "CCCC");
+        CHECK(ran_carried && ran_done);
+        CHECK(!side1_early && !side2_early);  // PathOpLock held both path ops until commit completed
+        CHECK((gen_files(ud / "gens" / std::to_string(read_current_gen(ud))) == std::set<std::string>{"A", "B", "D", "E"}));
+        CHECK(slurp_file(ud / "gens" / std::to_string(read_current_gen(ud)) / "B") == "B2B2");
+        CHECK(!get_save(f, a, &body));
+        CHECK(!get_save(f, e, &body));
+        CHECK(get_save(f, c, &body) && body == "CCCC");
+        CHECK(get_save(f, b, &body) && body == "B2B2");
+        CHECK(f.commit("savedata") == 0u);
+
+        // Rename + delete of dirty save.dat during commit must wait until commit finishes.
+        put_save(f, sv, "SAVE1");
+        CHECK(f.commit("savedata") == 0u);
+        put_save(f, sv, "SAVE2");
+        bool ran_sv = false, side3_early = true;
+        std::thread t3;
+        std::atomic<bool> d3{false};
+        uint32_t rc3 = 1, rc3b = 1;
+        f.set_fault_hook([&](const char* s) {
+            if (!std::strcmp(s, "commit:carried") && !ran_sv) {
+                ran_sv = true;
+                side3_early = run_side_held(t3, d3, [&] {
+                    rc3 = f.rename_file(sv, bak);
+                    rc3b = f.delete_file(bak);
+                });
+            }
+        });
+        CHECK(f.commit("savedata") == 0u);
+        f.set_fault_hook(nullptr);
+        t3.join();
+        CHECK(rc3 == 0u && rc3b == 0u && ran_sv && !side3_early);
+        const fs::path svgen = ud / "gens" / std::to_string(read_current_gen(ud));
+        CHECK(gen_files(svgen).count("save.dat") == 1);
+        CHECK(slurp_file(svgen / "save.dat") == "SAVE2");
+        CHECK(!get_save(f, sv, &body) && !get_save(f, bak, &body));
+        put_save(f, sv, "SAVE3");
+        CHECK(f.commit("savedata") == 0u);
+
+        // Failed commit (inject non-empty CURRENT.tmp directory) preserves concurrent writes/creations.
+        bool ran_fail = false, injected = false;
+        std::thread t4;
+        std::atomic<bool> d4{false};
+        uint32_t rc4 = 1;
+        f.set_fault_hook([&](const char* s) {
+            if (!std::strcmp(s, "commit:carried") && !ran_fail) {
+                ran_fail = true;
+                put_save(f, d, "D3D3");
+                run_side_held(t4, d4, [&] { rc4 = f.create_file(g, 4); }, 20);
+            }
+            if (!std::strcmp(s, "commit:marker") && !injected) {
+                injected = true;
+                fs::create_directories(ud / "CURRENT.tmp" / "block");
+            }
+        });
+        put_save(f, d, "D2D2");
+        CHECK(f.commit("savedata") != 0u);
+        t4.join();
+        CHECK(rc4 == 0u);
+        put_save(f, g, "GGGG");
+        fs::remove_all(ud / "CURRENT.tmp");
+        f.set_fault_hook(nullptr);
+        CHECK(f.commit("savedata") == 0u);
+        CHECK(f.unmount("savedata") == 0u);
+        CHECK(f.drain_for_exit(100));
+    }
+
+    hle::fs::Fs f;
+    f.set_save_root(root.string());
+    CHECK(f.mount_save("savedata", uid) == 0u);
+    CHECK(!get_save(f, a, &body));
+    CHECK(!get_save(f, e, &body));
+    CHECK(!get_save(f, bak, &body));
+    CHECK(get_save(f, b, &body) && body == "B2B2");
+    CHECK(get_save(f, c, &body) && body == "CCCC");
+    CHECK(get_save(f, d, &body) && body == "D3D3");
+    CHECK(get_save(f, g, &body) && body == "GGGG");
+    CHECK(get_save(f, sv, &body) && body == "SAVE3");
+    CHECK((gen_files(ud / "gens" / std::to_string(read_current_gen(ud))) == std::set<std::string>{"B", "C", "D", "G", "save.dat"}));
+    CHECK(f.unmount("savedata") == 0u);
+}
+
 int main() {
     test_host_fs_operations();
     test_fs_registry_and_shims();
+    test_save_commit_concurrent_ops();
     std::printf("fs_linux_test: %d checks, %d failures\n", g_checks.load(), g_fail.load());
     return g_fail.load() ? 1 : 0;
 }

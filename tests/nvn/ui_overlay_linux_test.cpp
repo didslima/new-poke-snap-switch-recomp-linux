@@ -9,6 +9,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -90,6 +91,24 @@ void test_sdl3_hotkeys_and_vulkan_present() {
   (void)win.poll_events();
   CHECK(snap::ui::fps_overlay_mode() != m0);
   snap::ui::fps_overlay_set("default");
+
+  // Exercise OS cursor lifecycle events (mouse enter/leave, focus lost/gained, minimized) cleanly.
+  auto push_win_ev = [&](SDL_EventType t) {
+    SDL_Event ev{};
+    ev.type = t;
+    ev.window.windowID = SDL_GetWindowID(static_cast<SDL_Window*>(win.native_handle()));
+    CHECK(SDL_PushEvent(&ev));
+  };
+  push_win_ev(SDL_EVENT_WINDOW_MOUSE_ENTER);
+  (void)win.poll_events();
+  push_win_ev(SDL_EVENT_WINDOW_FOCUS_LOST);
+  (void)win.poll_events();
+  push_win_ev(SDL_EVENT_WINDOW_MINIMIZED);
+  (void)win.poll_events();
+  push_win_ev(SDL_EVENT_WINDOW_RESTORED);
+  (void)win.poll_events();
+  push_win_ev(SDL_EVENT_WINDOW_MOUSE_LEAVE);
+  (void)win.poll_events();
 #endif
 
   // Exercise real ImGui + ImGui_ImplVulkan_Init + snap_ui_present() + snap_ui_shutdown() on Vulkan 1.3.
@@ -282,6 +301,16 @@ void test_stage6g_ui_features() {
   const int mode = snap_window_get_mode();
   CHECK(mode == SNAP_WINDOW_WINDOWED || mode == SNAP_WINDOW_BORDERLESS);
   CHECK(snap_window_monitor_count() >= 0);
+  float sx = 0.0f, sy = 0.0f;
+  // 1:1 5120x1440 (no DPI scaling)
+  snap::ui::host::scale_window_pos_to_display(1280.0f, 360.0f, 5120, 1440, 5120.0f, 1440.0f, &sx, &sy);
+  CHECK(std::fabs(sx - 1280.0f) < 1e-4f && std::fabs(sy - 360.0f) < 1e-4f);
+  // 125% DPI scaling on 5120x1440 (logical window 4096x1152 -> swapchain 5120x1440)
+  snap::ui::host::scale_window_pos_to_display(1000.0f, 400.0f, 4096, 1152, 5120.0f, 1440.0f, &sx, &sy);
+  CHECK(std::fabs(sx - 1250.0f) < 1e-4f && std::fabs(sy - 500.0f) < 1e-4f);
+  // Fallback when window size unavailable
+  snap::ui::host::scale_window_pos_to_display(100.0f, 200.0f, 0, 0, 5120.0f, 1440.0f, &sx, &sy);
+  CHECK(std::fabs(sx - 100.0f) < 1e-4f && std::fabs(sy - 200.0f) < 1e-4f);
 }
 
 }  // namespace

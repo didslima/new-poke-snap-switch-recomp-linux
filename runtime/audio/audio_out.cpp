@@ -9,6 +9,7 @@
 #include "audio_host.h"
 #include "audio_cfg.h"
 #include "audio_mix.h"
+#include "audio_dsp.h"
 #include "spsc_ring.h"
 
 #include <algorithm>
@@ -42,6 +43,7 @@ struct OutSlot {
   // device-thread private
   SnapAudioOutBuffer* cur = nullptr;
   uint64_t curFrame = 0;
+  bool starved = false;
 };
 
 const char* const kDeviceNames[4] = {"AudioStereoJackOutput", "AudioBuiltInSpeakerOutput", "AudioTvOutput", "AudioUsbOutput"};
@@ -51,6 +53,8 @@ enum Chk { kBadOpen, kNoSlot, kBadHandle, kBadBuffer, kQueueFull, kBadVolume, kB
 const char* const kChkName[kChkCount] = {"bad open parameters", "no free AudioOut", "AudioOut not open", "bad buffer", "submit queue full", "bad volume", "bad device pull"};
 constexpr uint64_t kMaxBufferBytes = 16ull << 20;   // Wwise submits ~4 KiB; anything past 16 MiB is not a sound buffer
 constexpr int kLoadFadeFrames = 2400;                // 50 ms at 48 kHz
+constexpr uint32_t kHoleFadeFrames = 96;            // 2 ms at 48 kHz: fade at both edges of an underrun hole
+constexpr float kGainSlewMs = 30.0f;                // master volume / mute: 0-to-1 time
 constexpr uint32_t kMaxPullFrames = 1u << 16;       // device periods are a few thousand frames
 
 struct Globals {
@@ -79,7 +83,16 @@ struct Globals {
   std::atomic<uint32_t> envMask{0};            // bit per category overridden by SNAP_VOL_*; set_volume on it is session-only
   std::atomic<float> deviceVol[4];
   int activeDevice = 2;  // AudioTvOutput
-  float curGain = 1.0f;  // device-thread private (smoothed)
+  snap_audio::dsp::GainSlew slew;
+  snap_audio::dsp::Limiter limiter;
+  snap_audio::dsp::Compressor comp;
+  bool dspInit = false;
+  bool limiterOn = true;
+  std::atomic<int> range{0};
+  std::vector<float> scratch;
+  int latencyMode = 1;
+  int resampler = 0;
+  std::string deviceName;
   // save states (os_state.cpp hooks at the end of this file): the state code sets stateHold, waits for inMix to drop, then reads or rewrites the slot rings
   std::atomic<int> stateHold{0}, inMix{0};
   std::atomic<int> fadeLeft{0};   // frames of fade-in still owed after a load (set while held)
@@ -95,7 +108,7 @@ struct Globals {
   std::atomic<uint64_t> appended{0}, releasedCount{0}, deviceChanges{0};
   std::atomic<uint64_t> chk[kChkCount] = {};
   std::atomic<uint32_t> chkLogged{0};   // bit per Chk kind (bit kChkCount = underrun): its one log line is out
-  std::atomic<uint32_t> bufFrames{0}, devChannels{2}, devRate{48000};
+  std::atomic<uint32_t> bufFrames{0}, devChannels{2}, devRate{48000}, streamRate{48000};
   std::atomic<double> latencyMs{0.0};
   std::atomic<int> attached{0};
   std::atomic<int> reportedChannels{2};
@@ -171,6 +184,27 @@ int parse_mode(const char* s) {
   if (!std::strcmp(s, "spatial")) return SNAP_AUDIO_OUT_SPATIAL;
   return -1;
 }
+int parse_latency(const char* s) {
+  if (!s) return -1;
+  if (!std::strcmp(s, "low")) return SNAP_AUDIO_LAT_LOW;
+  if (!std::strcmp(s, "normal")) return SNAP_AUDIO_LAT_NORMAL;
+  if (!std::strcmp(s, "safe")) return SNAP_AUDIO_LAT_SAFE;
+  return -1;
+}
+int parse_resampler(const char* s) {
+  if (!s) return -1;
+  if (!std::strcmp(s, "system")) return SNAP_AUDIO_RS_SYSTEM;
+  if (!std::strcmp(s, "linear")) return SNAP_AUDIO_RS_LINEAR;
+  if (!std::strcmp(s, "sinc")) return SNAP_AUDIO_RS_SINC;
+  return -1;
+}
+int parse_range(const char* s) {
+  if (!s) return -1;
+  if (!std::strcmp(s, "full")) return SNAP_AUDIO_RANGE_FULL;
+  if (!std::strcmp(s, "reduced")) return SNAP_AUDIO_RANGE_REDUCED;
+  if (!std::strcmp(s, "night")) return SNAP_AUDIO_RANGE_NIGHT;
+  return -1;
+}
 const char* mode_name(int m) { return m == SNAP_AUDIO_OUT_SPEAKERS ? "speakers" : m == SNAP_AUDIO_OUT_SPATIAL ? "spatial" : "stereo"; }
 
 // "output"/"channels"/"speakers" keys of audio.json (stored in g.cfg*). Env overrides are applied in ensure_init.
@@ -225,6 +259,10 @@ void default_cfg(SnapAudioConfig* c) {
   c->sampleRate = 48000;
   c->deviceBufferMs = 0;
   c->enableTap = 0;
+  c->latencyMode = -1;
+  c->resampler = -1;
+  c->range = -1;
+  c->device = nullptr;
 }
 
 // Counts one rejected call. The first of each kind logs one line (with the details of that call); the rest only count and show in
@@ -414,6 +452,19 @@ void ensure_init() {
   else if (g.cfg.channelMode == SNAP_AUDIO_CH_SURROUND51) gameCh = 6;
   else if (g.cfgGameCh) gameCh = (uint32_t)g.cfgGameCh;
   if (const char* e = std::getenv("SNAP_AUDIO_CHANNELS"); e && (std::atoi(e) == 2 || std::atoi(e) == 6)) gameCh = (uint32_t)std::atoi(e);
+  if (const char* e = std::getenv("SNAP_AUDIO_LIMITER"); e && *e) g.limiterOn = std::atoi(e) != 0;
+  int lat = parse_latency(std::getenv("SNAP_AUDIO_LATENCY")); if (lat < 0) lat = g.cfg.latencyMode;
+  if (lat < SNAP_AUDIO_LAT_LOW || lat > SNAP_AUDIO_LAT_SAFE) lat = SNAP_AUDIO_LAT_NORMAL;
+  int rs = parse_resampler(std::getenv("SNAP_AUDIO_RESAMPLER")); if (rs < 0) rs = g.cfg.resampler;
+  if (rs < SNAP_AUDIO_RS_SYSTEM || rs > SNAP_AUDIO_RS_SINC) rs = SNAP_AUDIO_RS_SYSTEM;
+  int rg = parse_range(std::getenv("SNAP_AUDIO_RANGE")); if (rg < 0) rg = g.cfg.range;
+  if (rg >= SNAP_AUDIO_RANGE_FULL && rg <= SNAP_AUDIO_RANGE_NIGHT) g.range.store(rg);
+  std::string dev;
+  if (const char* e = std::getenv("SNAP_AUDIO_DEVICE"); e && *e) dev = e;
+  else if (g.cfg.device && *g.cfg.device) dev = g.cfg.device;
+  if (dev == "default") dev.clear();
+  g.latencyMode = lat; g.resampler = rs; g.deviceName = dev;
+  g.backend->set_device(dev);
   uint32_t ch = 2;  // device mix channels
   if (mode == SNAP_AUDIO_OUT_SPATIAL) ch = 6;
   else if (mode == SNAP_AUDIO_OUT_SPEAKERS) {
@@ -430,7 +481,7 @@ void ensure_init() {
   g.activeMode.store(mode);
   g.guestCh.store(gameCh);
   std::fprintf(stderr, "[audio] output=%s, game channels=%u, device mix channels=%u\n", mode_name(mode), gameCh, ch);
-  g.devFmt = DeviceFormat{g.cfg.sampleRate ? g.cfg.sampleRate : 48000u, ch, g.cfg.deviceBufferMs, mode};
+  g.devFmt = DeviceFormat{g.cfg.sampleRate ? g.cfg.sampleRate : 48000u, ch, g.cfg.deviceBufferMs, mode, lat, rs, dev};
   g.reportedChannels.store((int)gameCh);
   g.devChannels.store(ch);
   g.devRate.store(g.devFmt.rate);
@@ -462,6 +513,11 @@ void core_mix(float* dst, uint32_t frames) {
   struct MixScope { std::atomic<int>& f; ~MixScope() { f.store(0, std::memory_order_seq_cst); } } mixScope{g.inMix};
   g.inMix.store(1, std::memory_order_seq_cst);
   if (g.stateHold.load(std::memory_order_seq_cst)) return;   // a save state is reading or rewriting the rings: a few ms of silence
+  if (!g.dspInit || g.limiter.channels() != dc) {
+    const uint32_t rate = g.devRate.load(std::memory_order_relaxed);
+    if (!g.dspInit) { g.slew.init(rate, kGainSlewMs, 1.0f); g.comp.init(rate); g.scratch.reserve((size_t)8192 * 8); g.dspInit = true; }
+    g.limiter.init(rate, dc);
+  }
   uint32_t shortest = 0;
   bool anyStarted = false, short_ = false;
   uint64_t fromGuest = 0;
@@ -471,9 +527,15 @@ void core_mix(float* dst, uint32_t frames) {
     s.inUse.store(1, std::memory_order_seq_cst);
     if (s.alive.load(std::memory_order_seq_cst) && s.started.load(std::memory_order_acquire)) {
       anyStarted = true;
-      const uint32_t got = mix_slot(s, dst, dc, frames);
+      const size_t ns = (size_t)frames * dc;
+      if (g.scratch.size() < ns) g.scratch.resize(ns);
+      std::fill(g.scratch.begin(), g.scratch.begin() + (std::ptrdiff_t)ns, 0.0f);
+      const uint32_t got = mix_slot(s, g.scratch.data(), dc, frames);
       fromGuest += got;
-      if (got < frames) { short_ = true; shortest = std::max(shortest, frames - got); }
+      if (got < frames) { short_ = true; shortest = std::max(shortest, frames - got); snap_audio::dsp::fade_out(g.scratch.data(), dc, got, kHoleFadeFrames); }
+      if (s.starved && got) snap_audio::dsp::fade_in(g.scratch.data(), dc, got, kHoleFadeFrames);
+      s.starved = got < frames;
+      for (size_t k = 0; k < ns; ++k) dst[k] += g.scratch[k];
     }
     s.inUse.store(0, std::memory_order_seq_cst);
   }
@@ -492,26 +554,24 @@ void core_mix(float* dst, uint32_t frames) {
     static int mono_logs = 0;
     if (dsum > 0 && mono_logs < 3) { ++mono_logs; std::fprintf(stderr, "[audio] mono audio on: left-right difference before averaging rms %.5f, after 0 (%u ch)\n", std::sqrt(dsum / (double)(frames ? frames : 1)), dc); }
   }
-  // master x device volume, ramped over the block
-  const float target = g.muted.load(std::memory_order_relaxed) ? 0.0f : g.vol[SNAP_VOL_MASTER].load(std::memory_order_relaxed) * g.deviceVol[g.activeDevice].load(std::memory_order_relaxed);
-  const float start = g.curGain;
-  g.curGain = target;
-  const float step = frames ? (target - start) / (float)frames : 0.0f;
-  float gain = start;
+  { const snap_audio::dsp::Range want = (snap_audio::dsp::Range)std::clamp(g.range.load(std::memory_order_relaxed), 0, 2); if (want != g.comp.range()) g.comp.set_range(want); }
+  g.comp.process(dst, dc, frames);
+  const bool muted = g.muted.load(std::memory_order_relaxed) != 0;
+  const float target = muted ? 0.0f : g.vol[SNAP_VOL_MASTER].load(std::memory_order_relaxed) * g.deviceVol[g.activeDevice].load(std::memory_order_relaxed);
+  g.slew.apply(dst, dc, frames, target);
   int fade = g.fadeLeft.load(std::memory_order_relaxed);
-  for (uint32_t f = 0; f < frames; ++f) {
-    float gg = gain;
-    if (fade > 0) { gg *= 1.0f - (float)fade / (float)kLoadFadeFrames; --fade; }   // after a load: ramp up from silence so the cut does not click
-    for (uint32_t c = 0; c < dc; ++c) {
-      float v = dst[f * dc + c] * gg;
-      dst[f * dc + c] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+  if (fade > 0) {
+    for (uint32_t f = 0; f < frames && fade > 0; ++f, --fade) {
+      const float gg = 1.0f - (float)fade / (float)kLoadFadeFrames;
+      for (uint32_t c = 0; c < dc; ++c) dst[f * dc + c] *= gg;
     }
-    gain += step;
+    g.fadeLeft.store(fade, std::memory_order_relaxed);
   }
-  if (fade != g.fadeLeft.load(std::memory_order_relaxed)) g.fadeLeft.store(fade, std::memory_order_relaxed);
+  if (g.limiterOn) g.limiter.process(dst, frames);
+  for (size_t k = 0, n = (size_t)frames * dc; k < n; ++k) dst[k] = dst[k] > 1.0f ? 1.0f : (dst[k] < -1.0f ? -1.0f : dst[k]);
   g.framesMixed.fetch_add(frames, std::memory_order_relaxed);
   g.framesFromGuest.fetch_add(fromGuest, std::memory_order_relaxed);
-  if (anyStarted && short_) {
+  if (anyStarted && short_ && !muted) {
     const uint64_t n = g.underruns.fetch_add(1, std::memory_order_relaxed) + 1;
     g.underrunFrames.fetch_add(shortest, std::memory_order_relaxed);
     log_underrun(n, shortest);
@@ -548,7 +608,7 @@ void core_set_device_info(bool attached, uint32_t bufferFrames, double latencyMs
   g.attached.store(attached ? 1 : 0);
   g.bufFrames.store(bufferFrames);
   g.latencyMs.store(latencyMs);
-  (void)rate;  // the rate is fixed at start(); WASAPI converts to the endpoint
+  if (rate) g.streamRate.store(rate);
   // A backend that fell back (spatial -> speakers -> stereo) reports the channel count it really opened. Only the
   // device thread calls core_mix, and the backend calls this from that thread, so the change is race free.
   if (channels && channels != g.devChannels.load()) {
@@ -583,7 +643,7 @@ SNAP_AUDIO_API uint32_t snap_nn_audio_OpenDefaultAudioOut(void* audioOut, const 
   for (int i = 0; i < kMaxOuts; ++i) {
     OutSlot& s = g.slots[i];
     if (s.alive.load()) continue;
-    s.rate = rate; s.channels = ch; s.cur = nullptr; s.curFrame = 0; s.started.store(0);
+    s.rate = rate; s.channels = ch; s.cur = nullptr; s.curFrame = 0; s.starved = false; s.started.store(0);
     s.submit.reset(); s.released.reset();
     uint32_t* w = static_cast<uint32_t*>(audioOut);
     w[0] = kOpenMagic; w[1] = (uint32_t)i; w[2] = rate; w[3] = ch;  // +8 rate, +12 channels (host-read only)
@@ -749,6 +809,22 @@ SNAP_AUDIO_API void snap_audio_set_volume(int c, float v) {
   g.volGen.fetch_add(1);
   save_volumes(g);
 }
+SNAP_AUDIO_API void snap_audio_set_range(int r) { if (r >= SNAP_AUDIO_RANGE_FULL && r <= SNAP_AUDIO_RANGE_NIGHT) G().range.store(r); }
+SNAP_AUDIO_API int snap_audio_get_range(void) { return G().range.load(); }
+SNAP_AUDIO_API int snap_audio_list_devices(char* out, int cap) {
+  if (!out || cap <= 0) return 0;
+  out[0] = 0;
+  const std::vector<std::string> v = list_render_devices();
+  std::string all;
+  int n = 0;
+  for (const std::string& d : v) {
+    if (all.size() + d.size() + 2 > (size_t)cap) break;
+    if (n) all += '\n';
+    all += d; ++n;
+  }
+  std::memcpy(out, all.c_str(), all.size() + 1);
+  return n;
+}
 SNAP_AUDIO_API void snap_audio_set_muted(int muted) { G().muted.store(muted ? 1u : 0u); }
 SNAP_AUDIO_API int snap_audio_get_muted(void) { return (int)G().muted.load(); }
 SNAP_AUDIO_API uint32_t snap_audio_volume_generation(void) { return G().volGen.load(); }
@@ -788,6 +864,9 @@ SNAP_AUDIO_API void snap_audio_get_stats(SnapAudioStats* s) {
   s->backendInUse = g.backend ? g.backend->kind() : 0;
   s->deviceAttached = g.attached;
   s->outputModeActive = g.activeMode; s->guestChannels = g.guestCh;
+  s->streamRate = g.streamRate; s->latencyMode = g.latencyMode;
+  s->resampler = g.streamRate.load() == g.devRate.load() ? SNAP_AUDIO_RS_SYSTEM : g.resampler;
+  s->range = g.range.load();
 }
 SNAP_AUDIO_API void snap_audio_reset_stats(void) {
   Globals& g = G();

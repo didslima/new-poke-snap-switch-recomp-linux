@@ -135,6 +135,8 @@ const std::unordered_set<std::string> &known_runtime_providers() {
         // shared host/mods/drpfast.cpp
         "rt_drp_decrypt",
         "rt_drp_decrypt_check",
+        // QA26 host/mods/ride_mouse_cam.cpp
+        "rt_gm_ride_mouse_cam",
         // libc / compiler builtins provided by host libc
         "memcpy",
         "memmove",

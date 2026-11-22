@@ -364,7 +364,11 @@ void tab_mouse() {
                  "Mouse movement drives the right stick, the camera aim. Off by default. While on, the cursor is hidden and held at the window center, the left button no longer acts as the touch screen, and during a ride the left button is A (Take Photo) and the right button is ZL (Zoom). Change those two in input.json (mouse.look_click_a, mouse.look_click_zl).");
   ImGui::BeginDisabled(!m.mouse_look);
   ch |= slider("Sensitivity", "##sens", &m.mouse_sensitivity, 0.1f, 5.0f, "%.2f",
-               "How far the stick moves for a given mouse speed. 1.00 reaches full deflection at about 1500 pixels per second.");
+               "Master multiplier for mouse look speed. 1.00 reaches full deflection at 40 pixels per frame.");
+  ch |= slider("Horizontal sensitivity", "##sens_x", &m.mouse_sens_x, 0.1f, 5.0f, "%.2f",
+               "Independent horizontal sensitivity multiplier.");
+  ch |= slider("Vertical sensitivity", "##sens_y", &m.mouse_sens_y, 0.1f, 5.0f, "%.2f",
+               "Independent vertical sensitivity multiplier.");
   ch |= checkbox("Invert horizontal", &m.mouse_invert_x, "Moving the mouse right turns the camera left.");
   ch |= checkbox("Invert vertical", &m.mouse_invert_y, "Moving the mouse up aims down, like a flight stick.");
   ch |= slider("Smoothing", "##smooth", &m.mouse_smoothing, 0.0f, 1.0f, m.mouse_smoothing <= 0.001f ? tr("Off") : "%.2f",

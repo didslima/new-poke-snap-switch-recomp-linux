@@ -65,8 +65,11 @@ struct OutWin {
   uint64_t total = 0, flushed = 0;
   uint32_t crc = 0;
   bool err = false;
+  uint64_t limit = ~0ull;
   explicit OutWin(std::ofstream& s) : f(s) {}
   void put(uint8_t b) {
+    if (err) return;
+    if (total >= limit) { err = true; return; }
     ring[total & 0xFFFF] = b;
     ++total;
     if (total - flushed == 0x8000) drain();
@@ -235,6 +238,8 @@ bool list(const fs::path& zp, std::vector<Entry>& out, std::string* err) {
   f.seekg((std::streamoff)cd_off);
   f.read((char*)cd.data(), (std::streamsize)cd_size);
   if ((uint64_t)f.gcount() != cd_size) { *err = "That zip file is damaged (directory unreadable)."; return false; }
+  constexpr uint64_t kMaxFiles = 200000;
+  uint64_t total_us = 0, files = 0;
   size_t p = 0;
   for (uint64_t k = 0; k < count; ++k) {
     if (p + 46 > cd.size() || rd32(&cd[p]) != 0x02014b50u) { *err = "That zip file is damaged (bad directory entry)."; return false; }
@@ -260,6 +265,9 @@ bool list(const fs::path& zp, std::vector<Entry>& out, std::string* err) {
     p += 46 + nl + el + cl;
     if (name.empty() || name.back() == '/') continue;
     if (flags & 1) { *err = "That zip file is password protected."; return false; }
+    if (++files > kMaxFiles) { *err = "That zip file has too many files (more than " + std::to_string(kMaxFiles) + ")."; return false; }
+    total_us += us;
+    if (us > (4ull << 30) || total_us > (4ull << 30)) { *err = "That zip file expands to more than 4 GB, so it was refused."; return false; }
     Entry se;
     se.rel = name; se.size = us; se.csize = cs; se.lho = lho; se.method = method; se.crc = crc;
     out.push_back(se);
@@ -295,6 +303,7 @@ bool extract(const fs::path& zip, const Entry& e, const fs::path& dst, std::stri
   } else if (e.method == 8) {
     BitIn bi(in, e.csize);
     OutWin ow(out);
+    ow.limit = e.size;
     ok = inflate_stream(bi, ow);
     crc = ow.crc; written = ow.total;
   } else {

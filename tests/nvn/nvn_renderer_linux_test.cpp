@@ -7,6 +7,8 @@
 #include "nvn_host.h"
 #include "nvn_hdr.h"
 #include "nvn_internal.h"
+#include "nvn_foliage.h"
+#include "nvn_motionaa.h"
 #include "upscale/upscale_dlss_host.h"
 #include "upscale/upscale_nvn.h"
 #include "upscale/upscaler.h"
@@ -152,6 +154,22 @@ void test_live_graphics_and_ultrawide() {
     CHECK(hle::live::changed(seen));
     CHECK(!hle::live::changed(seen));
   }
+
+  // Verify SpecularAaEnabled() defaults OFF and toggles live via specular_aa.
+  CHECK(!nvn::SpecularAaEnabled());
+  hle::settings::set("specular_aa", "1");
+  CHECK(hle::live::changed(seen));
+  CHECK(nvn::SpecularAaEnabled());
+  hle::settings::set("specular_aa", "default");
+  CHECK(hle::live::changed(seen));
+  CHECK(!nvn::SpecularAaEnabled());
+
+  // Verify HdfxFactorNow() defaults OFF (1.0f) and responds to SNAP_HD_EFFECTS.
+  unsetenv("SNAP_HD_EFFECTS");
+  CHECK(std::fabs(nvn::HdfxFactorNow() - 1.0f) < 0.001f);
+  setenv("SNAP_HD_EFFECTS", "1", 1);
+  CHECK(std::fabs(nvn::HdfxFactorNow() - 2.0f) < 0.001f);
+  unsetenv("SNAP_HD_EFFECTS");
 
   if (saved_cfg.empty()) unsetenv("SNAP_CONFIG_DIR");
   else setenv("SNAP_CONFIG_DIR", saved_cfg.c_str(), 1);
@@ -339,6 +357,110 @@ void test_fsr3_linux_backend() {
                                      kPermLowResMv, &bad_blob) == FFX_ERROR_INVALID_ARGUMENT);
 }
 
+void test_motionaa_shutdown_and_foliage_stable() {
+  // 1. MotionAaShutdown is safe when uninitialized, with null device, and when called repeatedly (no double-free).
+  nvn::MotionAaShutdown(nullptr);
+  nvn::Host dummy_host{};
+  dummy_host.device = VK_NULL_HANDLE;
+  nvn::MotionAaShutdown(&dummy_host);
+  nvn::MotionAaShutdown(&dummy_host);
+
+  // 2. FoliageStableEnabled() defaults OFF and toggles live via SNAP_FOLIAGE_STABLE without affecting SpecularAA/HD Effects.
+  unsetenv("SNAP_FOLIAGE_STABLE");
+  unsetenv("SNAP_FOLIAGE_AA");
+  unsetenv("SNAP_LEAF_TRANSLUCENCY");
+  unsetenv("SNAP_SPECULAR_AA");
+  unsetenv("SNAP_HD_EFFECTS");
+  hle::live::bump();
+  CHECK(!nvn::FoliageStableEnabled());
+  CHECK(!nvn::SpecularAaEnabled());
+  CHECK(nvn::HdfxFactorNow() == 1.0f);
+  CHECK(nvn::FoliagePipeBits(5, 0.5f, 97 /*R16G16B16A16_SFLOAT*/, 1001 /*DEPTH32F*/, true, 1, false, 7, true) == 0u);
+
+  setenv("SNAP_FOLIAGE_STABLE", "1", 1);
+  hle::live::bump();
+  CHECK(nvn::FoliageStableEnabled());
+  const uint32_t color_bits = nvn::FoliagePipeBits(5, 0.5f, 97, 1001, true, 1, false, 7, true);
+  CHECK((color_bits & 4u) != 0u);
+  const uint32_t prepass_bits = nvn::FoliagePipeBits(5, 0.5f, 0, 1001, true, 0, false, 7, true);
+  CHECK((prepass_bits & 4u) != 0u);
+
+  // Compatible with SpecularAA and HD Effects both ON.
+  setenv("SNAP_SPECULAR_AA", "1", 1);
+  setenv("SNAP_HD_EFFECTS", "1", 1);
+  hle::live::bump();
+  CHECK(nvn::FoliageStableEnabled());
+  CHECK(nvn::SpecularAaEnabled());
+  CHECK(nvn::HdfxFactorNow() == 2.0f);
+
+  // 3. PatchCaptureAlphaLod + PatchAlphaHash SPIR-V patching on a minimal valid fragment shader.
+  // Minimal SPIR-V 1.0 fragment module with OpImageSampleImplicitLod(vec2) -> vec4, OpCompositeExtract alpha -> OpStore outCol.
+  auto op = [](uint16_t opcode, std::initializer_list<uint32_t> ops) {
+    std::vector<uint32_t> v;
+    v.push_back((static_cast<uint32_t>(ops.size() + 1) << 16) | opcode);
+    v.insert(v.end(), ops.begin(), ops.end());
+    return v;
+  };
+  std::vector<uint32_t> spv = {0x07230203u, 0x00010000u, 0u, 22u, 0u};
+  auto emit = [&](std::initializer_list<uint32_t> words) { spv.insert(spv.end(), words.begin(), words.end()); };
+  auto emit_op = [&](uint16_t opcode, std::initializer_list<uint32_t> ops) {
+    auto v = op(opcode, ops);
+    spv.insert(spv.end(), v.begin(), v.end());
+  };
+  emit_op(17, {1});                 // OpCapability Shader
+  emit_op(14, {0, 1});              // OpMemoryModel Logical GLSL450
+  emit_op(15, {4, 1, 0x6e69616du, 18}); // OpEntryPoint Fragment %1 "main" %18
+  emit_op(16, {1, 7});              // OpExecutionMode %1 OriginUpperLeft
+  emit_op(71, {18, 30, 0});         // OpDecorate %18 Location 0
+  emit_op(20, {2});                 // %2 = OpTypeVoid
+  emit_op(33, {3, 2});              // %3 = OpTypeFunction %2
+  emit_op(22, {4, 32});             // %4 = OpTypeFloat 32
+  emit_op(23, {5, 4, 2});           // %5 = OpTypeVector %4 2
+  emit_op(23, {6, 4, 4});           // %6 = OpTypeVector %4 4
+  emit_op(25, {7, 4, 1, 0, 0, 0, 1, 0}); // %7 = OpTypeImage %4 2D 0 0 0 1 Unknown
+  emit_op(27, {8, 7});              // %8 = OpTypeSampledImage %7
+  emit_op(32, {9, 0, 8});           // %9 = OpTypePointer UniformConstant %8
+  emit_op(32, {10, 3, 6});          // %10 = OpTypePointer Output %6
+  emit_op(32, {11, 6, 5});          // %11 = OpTypePointer Private %5
+  emit_op(59, {9, 12, 0});          // %12 = OpVariable %9 UniformConstant
+  emit_op(59, {10, 18, 3});         // %18 = OpVariable %10 Output
+  emit_op(59, {11, 13, 1});         // %13 = OpVariable %11 Input (used as vec2 coord source)
+  emit_op(54, {2, 1, 0, 3});        // %1 = OpFunction %2 None %3
+  emit_op(248, {14});               // %14 = OpLabel
+  emit_op(61, {8, 15, 12});         // %15 = OpLoad %8 %12
+  emit_op(61, {5, 16, 13});         // %16 = OpLoad %5 %13
+  emit_op(87, {6, 17, 15, 16});     // %17 = OpImageSampleImplicitLod %6 %15 %16
+  emit_op(81, {4, 19, 17, 3});      // %19 = OpCompositeExtract %4 %17 3
+  emit_op(62, {18, 17});            // OpStore %18 %17
+  emit_op(253, {});                 // OpReturn
+  emit_op(56, {});                  // OpFunctionEnd
+  (void)emit;
+
+  std::vector<uint32_t> spv_lod, spv_patched;
+  uint32_t lod_var = 0;
+  CHECK(nvn::PatchCaptureAlphaLod(spv, spv_lod, &lod_var));
+  CHECK(lod_var != 0);
+  CHECK(spv_lod.size() > spv.size());
+  // Verify OpCapability ImageQuery (50) and OpImageQueryLod (105) were emitted.
+  bool has_img_query_cap = false, has_query_lod = false;
+  for (size_t i = 5; i < spv_lod.size();) {
+    const uint32_t wc = spv_lod[i] >> 16, opcode = spv_lod[i] & 0xFFFFu;
+    if (opcode == 17 && wc >= 2 && spv_lod[i + 1] == 50) has_img_query_cap = true;
+    if (opcode == 105) has_query_lod = true;
+    i += wc ? wc : 1;
+  }
+  CHECK(has_img_query_cap && has_query_lod);
+
+  CHECK(nvn::PatchAlphaHash(spv_lod, 5 /*GREATER*/, false, false, 0, spv_patched, lod_var));
+  CHECK(spv_patched.size() > spv_lod.size());
+
+  // Restore clean default env state.
+  unsetenv("SNAP_FOLIAGE_STABLE");
+  unsetenv("SNAP_SPECULAR_AA");
+  unsetenv("SNAP_HD_EFFECTS");
+  hle::live::bump();
+}
+
 }  // namespace
 
 int main() {
@@ -349,6 +471,7 @@ int main() {
   test_upscale_and_hdr_defaults();
   test_ultrawide_cutscene_upscale_aspect();
   test_fsr3_linux_backend();
+  test_motionaa_shutdown_and_foliage_stable();
   std::printf("nvn_renderer_linux_test: %d checks, %d failed\n", g_checks, g_fails);
   return g_fails == 0 ? 0 : 1;
 }

@@ -40,29 +40,44 @@ extern "C" uint64_t snap_present_count() {
     return g_presents.load(std::memory_order_relaxed);
 }
 
-void apply_frame_rate_target() {
+void apply_frame_rate_target(bool allow_pacing_set = true) {
     static std::atomic<unsigned> seen{0};
-    if (!hle::live::changed(seen)) return;
-
-    int target = 60;
-    {
-        hle::live::EnvRead env_read;
-        const char *value = std::getenv("SNAP_FPS");
-        if (value && *value && std::strcmp(value, "default") != 0) {
-            char *end = nullptr;
-            const long parsed = std::strtol(value, &end, 10);
-            if (end && *end == '\0' && (parsed == 72 || parsed == 90 || parsed == 120 || parsed == 144 || parsed == 165 || parsed == 240)) {
-                target = static_cast<int>(parsed);
-            } else if (parsed != 60) {
-                std::fprintf(stderr, "[highfps] SNAP_FPS=%s ignored (use default, 60, 72, 90, 120, 144, 165 or 240)\n", value);
+    static int s_target = 60;
+    if (hle::live::changed(seen)) {
+        int target = 60;
+        {
+            hle::live::EnvRead env_read;
+            const char *value = std::getenv("SNAP_FPS");
+            if (value && *value && std::strcmp(value, "default") != 0) {
+                char *end = nullptr;
+                const long parsed = std::strtol(value, &end, 10);
+                if (end && *end == '\0' && (parsed == 72 || parsed == 90 || parsed == 120 || parsed == 144 || parsed == 165 || parsed == 240)) {
+                    target = static_cast<int>(parsed);
+                } else if (parsed != 60) {
+                    std::fprintf(stderr, "[highfps] SNAP_FPS=%s ignored (use default, 60, 72, 90, 120, 144, 165 or 240)\n", value);
+                }
             }
         }
+        s_target = target;
+        if (allow_pacing_set) {
+            nvnHostSetFramePacing(static_cast<double>(s_target));
+            const int cap = snap_window_frame_cap();
+            std::fprintf(stderr, "[highfps] pacing target %d Hz%s\n", s_target,
+                         cap > 0 && cap < s_target ? " (lowered by the frame-rate limit option)" : "");
+        }
     }
+}
 
-    nvnHostSetFramePacing(static_cast<double>(target));
-    const int cap = snap_window_frame_cap();
-    std::fprintf(stderr, "[highfps] pacing target %d Hz%s\n", target,
-                 cap > 0 && cap < target ? " (lowered by the frame-rate limit option)" : "");
+double current_fps_target_hz() {
+    const char *value = std::getenv("SNAP_FPS");
+    if (value && *value && std::strcmp(value, "default") != 0) {
+        char *end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end && *end == '\0' && (parsed == 72 || parsed == 90 || parsed == 120 || parsed == 144 || parsed == 165 || parsed == 240)) {
+            return static_cast<double>(parsed);
+        }
+    }
+    return 60.0;
 }
 
 bool ultrawide_disabled_by_env() {
@@ -106,7 +121,8 @@ void vi_get_native_window_host(Cpu *c) {
 void hook_present(void *, int slot, int w, int h) {
     const WindowEvents ev = pump_host_window_events();
     const uint64_t n = ++g_presents;
-    apply_frame_rate_target();
+    const bool fast_boot_active = fast_boot_on_present(n, current_fps_target_hz());
+    apply_frame_rate_target(!fast_boot_active);
     if (n <= 3 || n % 30 == 0) {
         loader::trace("nvn: present #%llu slot %d %dx%d (submits %llu)",
                       static_cast<unsigned long long>(n), slot, w, h,

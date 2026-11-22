@@ -22,7 +22,8 @@
 #include "hle.h"
 
 extern "C" void snap_audio_log_checks(void);   // runtime/audio/audio_out.cpp: the "[audio] checks:" counter line, printed before a route ends the run
-extern "C" void snap_audio_log_checks_none(void) {}   // test builds without the audio layer link this instead (bound in hle_host_win32.cpp / weak in hle_host_posix.cpp)
+extern "C" void snap_audio_log_checks_none(void) {}   // test builds without the audio layer link this instead
+#pragma comment(linker, "/alternatename:snap_audio_log_checks=snap_audio_log_checks_none")
 namespace nvn { extern int g_presentCount; extern int g_fdBurst; }   // runtime/nvn/nvn_tex_vk.cpp: frame clock for '@f' script times; nvn_vk.cpp: NVN_FRAME_DUMP burst (script token shot=<n>)
 
 namespace hle::input {
@@ -33,10 +34,13 @@ bool consume_screenshot() { return g_shot_req.exchange(false); }
 extern "C" void snap_state_request(int op, const char* name);   // runtime/os/os_state.cpp: queue a save (1) or load (2); a worker thread does it
 extern "C" int snap_state_idle();
 extern "C" int snap_state_count(const char* kind);   // "saves..." / "loads..." (ok) or "done..." (ok or refused) finished since the process started
-// test builds without the OS layer (tests/hle) link these instead (bound in hle_host_win32.cpp / weak in hle_host_posix.cpp)
+// test builds without the OS layer (tests/hle) link these instead
 extern "C" void snap_state_request_none(int, const char*) {}
 extern "C" int snap_state_idle_none() { return 1; }
 extern "C" int snap_state_count_none(const char*) { return 0; }
+#pragma comment(linker, "/alternatename:snap_state_request=snap_state_request_none")
+#pragma comment(linker, "/alternatename:snap_state_idle=snap_state_idle_none")
+#pragma comment(linker, "/alternatename:snap_state_count=snap_state_count_none")
 // Route aim tool (host/mods/aim.cpp, developer tool, needs SNAP_AIM=1): the `aim`, `shoot` and `wait_pose` route lines. Test builds
 // and runs without the tool get the stand-ins: no target, always "ready", no stick.
 extern "C" void snap_aim_set(const char* spec);               // "<target> [tol=<f>] [range=<m>]" or "off"
@@ -46,13 +50,20 @@ extern "C" void snap_aim_shot(void);                          // a `shoot` line 
 extern "C" int snap_aim_pose(const char* text, char* why, int n);   // the target's current motion event name contains text
 extern "C" int snap_aim_act(const char* text, char* why, int n);    // the viewfinder is locked on an actor playing that event
 extern "C" int snap_aim_act_none(const char*, char* why, int n) { if (why && n > 0) std::snprintf(why, (size_t)n, "aim tool off"); return 0; }
+#pragma comment(linker, "/alternatename:snap_aim_act=snap_aim_act_none")
 extern "C" void snap_aim_set_none(const char*) {}
 extern "C" int snap_aim_ready_none(char* why, int n) { if (why && n > 0) std::snprintf(why, (size_t)n, "aim tool off"); return 1; }
 extern "C" int snap_aim_stick_none(float*, float*) { return 0; }
 extern "C" void snap_aim_shot_none(void) {}
 extern "C" int snap_aim_pose_none(const char*, char* why, int n) { if (why && n > 0) std::snprintf(why, (size_t)n, "aim tool off"); return 1; }
+#pragma comment(linker, "/alternatename:snap_aim_set=snap_aim_set_none")
+#pragma comment(linker, "/alternatename:snap_aim_ready=snap_aim_ready_none")
+#pragma comment(linker, "/alternatename:snap_aim_stick=snap_aim_stick_none")
+#pragma comment(linker, "/alternatename:snap_aim_shot=snap_aim_shot_none")
+#pragma comment(linker, "/alternatename:snap_aim_pose=snap_aim_pose_none")
 extern "C" void snap_import_counts_dump(const char* tag);   // host/loader.cpp (debug, needs SNAP_IMPORT_COUNT=1): imports called since the last dump
 extern "C" void snap_import_counts_dump_none(const char*) {}
+#pragma comment(linker, "/alternatename:snap_import_counts_dump=snap_import_counts_dump_none")
 
 // ---------------------------------------------------------------------------------------------------------------
 // names
@@ -225,7 +236,7 @@ Mapping Mapping::defaults() {
   set(kStickR, {"pad:rstick"});
   set(kL, {"pad:lshoulder", "key:Q"});
   set(kR, {"pad:rshoulder", "key:E"});
-  set(kZL, {"pad:ltrigger", "key:LShift", "mouse:wheel_up", "mouse:wheel_down"});   // zoom; a wheel notch holds it for 0.1 s; the right mouse button holds it on a ride (look_zl)
+  set(kZL, {"pad:ltrigger", "key:LShift"});   // zoom; the right mouse button holds it on a ride (look_zl)
   set(kZR, {"pad:rtrigger", "key:Space"});
   set(kPlus, {"pad:start", "key:P", "key:Tab"});
   set(kMinus, {"pad:back", "key:Backspace"});
@@ -277,6 +288,8 @@ Json Mapping::to_json() const {
   mouse.set("touch", Json::boolean_(mouse_touch));
   mouse.set("look", Json::boolean_(mouse_look));
   mouse.set("sensitivity", Json::number(mouse_sensitivity));
+  mouse.set("sensitivity_x", Json::number(mouse_sens_x));
+  mouse.set("sensitivity_y", Json::number(mouse_sens_y));
   mouse.set("invert_x", Json::boolean_(mouse_invert_x));
   mouse.set("invert_y", Json::boolean_(mouse_invert_y));
   mouse.set("smoothing", Json::number(mouse_smoothing));
@@ -357,6 +370,8 @@ bool Mapping::from_json(const Json& j, std::string* err) {
     if (auto* t = v->get("look_click_zl")) if (!read_sources(*t, &m.look_zl, err, "mouse.look_click_zl")) return false;
     if (auto* t = v->get("look")) m.mouse_look = t->boolean(true);
     if (auto* t = v->get("sensitivity")) m.mouse_sensitivity = clampf(t, 1.0, 0.05f, 10.0f);
+    if (auto* t = v->get("sensitivity_x")) m.mouse_sens_x = clampf(t, 1.0, 0.05f, 10.0f);
+    if (auto* t = v->get("sensitivity_y")) m.mouse_sens_y = clampf(t, 1.0, 0.05f, 10.0f);
     if (auto* t = v->get("invert_x")) m.mouse_invert_x = t->boolean(false);
     if (auto* t = v->get("invert_y")) m.mouse_invert_y = t->boolean(false);
     if (auto* t = v->get("smoothing")) m.mouse_smoothing = clampf(t, 0.0, 0.0f, 1.0f);
@@ -462,6 +477,7 @@ void reset_device(Mapping& m, Device d) {
     for (StickMap* s : {&m.left, &m.right}) { StickMap* ds = s == &m.left ? &def.left : &def.right; s->analog = ds->analog; s->deadzone = ds->deadzone; s->outer_deadzone = ds->outer_deadzone; s->invert_y = false; }
   } else if (d == kDevMouse) {
     m.mouse_touch = def.mouse_touch; m.mouse_look = def.mouse_look; m.mouse_sensitivity = def.mouse_sensitivity;
+    m.mouse_sens_x = def.mouse_sens_x; m.mouse_sens_y = def.mouse_sens_y;
     m.mouse_invert_x = m.mouse_invert_y = false; m.mouse_smoothing = 0; m.lock_cursor = def.lock_cursor;
     m.look_a = def.look_a; m.look_zl = def.look_zl;
   }
@@ -533,13 +549,145 @@ static const EnvFx& env_fx() {
 bool rumble_log_enabled() { return env_fx().rumble_log; }
 bool gyro_aim_enabled() { return env_fx().gyro_set ? env_fx().gyro : pad_fx().gyro_on.load(); }
 
-void gyro_to_stick(float yaw, float pitch, float sens, bool inv_x, bool inv_y, float* sx, float* sy) {
-  auto dz = [](float v) {
+int stick_curve_from_name(const std::string& n) {
+  if (n == "classic" || n == "1") return kCurveClassic;
+  if (n == "precise" || n == "2") return kCurvePrecise;
+  return kCurveLinear;
+}
+float apply_stick_curve(int curve, float t) {
+  t = std::clamp(t, 0.0f, 1.0f);
+  switch (curve) {
+    case kCurveClassic: return std::pow(t, 1.5f);
+    case kCurvePrecise: return std::pow(t, 2.2f);
+    default: return t;
+  }
+}
+void VelWindow::velocity(uint64_t t, uint64_t win_ns, float* vx, float* vy) {
+  size_t drop = 0;
+  while (drop < v.size() && t - v[drop].t > 400000000ull) ++drop;
+  if (drop) v.erase(v.begin(), v.begin() + (long)drop);
+  double sx = 0, sy = 0;
+  for (auto& m : v) if (t - m.t <= win_ns) { sx += m.dx; sy += m.dy; }
+  const double secs = (double)win_ns * 1e-9;
+  *vx = secs > 0 ? (float)(sx / secs) : 0.0f;
+  *vy = secs > 0 ? (float)(sy / secs) : 0.0f;
+}
+float ema_step(float prev, float in, float dt_s, float tau_s) {
+  if (tau_s <= 1e-6f) return in;
+  if (dt_s <= 0) return prev;
+  const float a = 1.0f - std::exp(-dt_s / tau_s);
+  return prev + (in - prev) * a;
+}
+static DeltaAccum g_raw_mouse;
+void post_raw_mouse(int dx, int dy) { g_raw_mouse.add(dx, dy); }
+DeltaAccum& raw_mouse() { return g_raw_mouse; }
+
+static std::atomic<bool> g_has_mouse_pos{false};
+static std::atomic<float> g_mouse_pos_x{0.0f};
+static std::atomic<float> g_mouse_pos_y{0.0f};
+static std::atomic<bool> g_mouse_in_win{false};
+static std::atomic<bool> g_mouse_ui_active{false};
+static std::atomic<bool> g_ui_in_ride{false};
+static std::atomic<bool> g_ui_menu_open{false};
+static std::atomic<bool> g_ui_focused{true};
+void post_mouse_pos(float nx, float ny, bool in_window) {
+  const float prev_x = g_mouse_pos_x.load(std::memory_order_relaxed);
+  const float prev_y = g_mouse_pos_y.load(std::memory_order_relaxed);
+  const bool had = g_has_mouse_pos.load(std::memory_order_relaxed);
+  g_mouse_pos_x.store(nx, std::memory_order_relaxed);
+  g_mouse_pos_y.store(ny, std::memory_order_relaxed);
+  g_mouse_in_win.store(in_window, std::memory_order_relaxed);
+  g_has_mouse_pos.store(true, std::memory_order_release);
+  if (in_window && (!had || std::fabs(nx - prev_x) > 1e-4f || std::fabs(ny - prev_y) > 1e-4f)) {
+    g_mouse_ui_active.store(true, std::memory_order_release);
+  }
+}
+bool read_posted_mouse_pos(float* nx, float* ny, bool* in_window) {
+  if (!g_has_mouse_pos.load(std::memory_order_acquire)) return false;
+  if (nx) *nx = g_mouse_pos_x.load(std::memory_order_relaxed);
+  if (ny) *ny = g_mouse_pos_y.load(std::memory_order_relaxed);
+  if (in_window) *in_window = g_mouse_in_win.load(std::memory_order_relaxed);
+  return true;
+}
+bool ui_pointer_1080(float* gx, float* gy) {
+  if (g_ui_in_ride.load(std::memory_order_relaxed) || g_ui_menu_open.load(std::memory_order_relaxed) ||
+      !g_ui_focused.load(std::memory_order_relaxed) || !g_mouse_ui_active.load(std::memory_order_acquire)) {
+    return false;
+  }
+  float nx = 0.0f, ny = 0.0f;
+  bool in_win = false;
+  if (!read_posted_mouse_pos(&nx, &ny, &in_win) || !in_win) return false;
+  float x = nx * 1920.0f, y = ny * 1080.0f;
+  if (g_window_to_guest) g_window_to_guest(nx, ny, &x, &y);
+  if (gx) *gx = std::clamp(x, 0.0f, 1920.0f);
+  if (gy) *gy = std::clamp(y, 0.0f, 1080.0f);
+  return true;
+}
+
+static std::atomic<bool> g_sdl3_cursor_lock{false};
+static std::atomic<bool> g_sdl3_cursor_recenter{false};
+// QA26: AOT Ride camera direct mouse-look state (off unless SNAP_MOUSE_AOT_CAMERA=1).
+namespace {
+struct AotMouseCamState {
+  std::mutex mu;
+  float dx = 0.0f;
+  float dy = 0.0f;
+  bool zoom = false;
+};
+AotMouseCamState& aot_cam_state() {
+  static AotMouseCamState s;
+  return s;
+}
+}  // namespace
+bool aot_camera_enabled() {
+  const char* v = std::getenv("SNAP_MOUSE_AOT_CAMERA");
+  return v && std::atoi(v) != 0;
+}
+void post_aot_mouse_delta(float dx, float dy, bool zoom_active) {
+  AotMouseCamState& s = aot_cam_state();
+  std::lock_guard<std::mutex> g(s.mu);
+  s.dx += dx;
+  s.dy += dy;
+  s.zoom = zoom_active;
+}
+bool take_aot_mouse_delta(float* dx, float* dy, bool* zoom_active) {
+  AotMouseCamState& s = aot_cam_state();
+  std::lock_guard<std::mutex> g(s.mu);
+  const float x = s.dx;
+  const float y = s.dy;
+  const bool z = s.zoom;
+  s.dx = 0.0f;
+  s.dy = 0.0f;
+  if (dx) *dx = x;
+  if (dy) *dy = y;
+  if (zoom_active) *zoom_active = z;
+  return x != 0.0f || y != 0.0f;
+}
+void reset_aot_mouse_delta() {
+  AotMouseCamState& s = aot_cam_state();
+  std::lock_guard<std::mutex> g(s.mu);
+  s.dx = 0.0f;
+  s.dy = 0.0f;
+  s.zoom = false;
+}
+
+void set_sdl3_cursor_mode(bool lock, bool recenter) {
+  g_sdl3_cursor_lock.store(lock, std::memory_order_relaxed);
+  g_sdl3_cursor_recenter.store(recenter, std::memory_order_relaxed);
+}
+void sdl3_cursor_mode(bool* lock, bool* recenter) {
+  if (lock) *lock = g_sdl3_cursor_lock.load(std::memory_order_relaxed);
+  if (recenter) *recenter = g_sdl3_cursor_recenter.load(std::memory_order_relaxed);
+}
+
+void gyro_to_stick(float yaw, float pitch, float sens, bool inv_x, bool inv_y, float* sx, float* sy, float dead) {
+  dead = std::clamp(dead, 0.0f, kGyroFullDegPerSec - 5.0f);
+  auto dz = [dead](float v) {
     float a = std::fabs(v);
-    if (a <= kGyroDeadDegPerSec) return 0.0f;
-    return std::copysign(a - kGyroDeadDegPerSec, v);   // subtract the dead zone so there is no jump at its edge
+    if (a <= dead) return 0.0f;
+    return std::copysign(a - dead, v);   // subtract the dead zone so there is no jump at its edge
   };
-  float s = std::max(0.0f, sens) / (kGyroFullDegPerSec - kGyroDeadDegPerSec);
+  float s = std::max(0.0f, sens) / (kGyroFullDegPerSec - dead);
   float x = -dz(yaw) * s;      // turning the pad to the right (negative yaw rate) pushes the stick right
   float y = dz(pitch) * s;     // tipping the front up pushes the stick up
   *sx = std::clamp(inv_x ? -x : x, -1.0f, 1.0f);
@@ -555,9 +703,12 @@ static void stick_value(const StickMap& sm, bool is_left, const Mapping& m, cons
     float ax = analog == "left" ? in.lx : in.rx, ay = analog == "left" ? in.ly : in.ry;
     if (sm.invert_y) ay = -ay;
     float mag = std::sqrt(ax * ax + ay * ay);
-    if (mag > sm.deadzone) {
-      float span = std::max(0.01f, sm.outer_deadzone - sm.deadzone);
-      float scale = std::min(1.0f, (mag - sm.deadzone) / span) / mag;  // radial: inner dead zone, saturation at the outer one
+    const float ovr = pad_fx().stick_deadzone.load(std::memory_order_relaxed);
+    const float dzone = ovr >= 0.0f ? std::min(ovr, 0.9f) : sm.deadzone;
+    const float outer = ovr >= 0.0f ? std::max(sm.outer_deadzone, dzone + 0.05f) : sm.outer_deadzone;
+    if (mag > dzone) {
+      float span = std::max(0.01f, outer - dzone);
+      float scale = apply_stick_curve(pad_fx().stick_curve.load(std::memory_order_relaxed), std::min(1.0f, (mag - dzone) / span)) / mag;  // radial: inner dead zone, saturation at the outer one
       x = ax * scale; y = ay * scale;
     }
   }
@@ -599,11 +750,9 @@ PadSample map_pad(const Mapping& m, const RawInput& in) {
     for (int d = 0; d < 4; ++d)
       for (const Source& s : *dirs[d]) if (s.kind == Source::KeyboardKey && source_down(s, eff, 0.5f)) { out.buttons |= 1ull << pads[d]; break; }
   }
-  if (eff.focused && !eff.in_ride && m.mouse_touch) {   // menus: the touch screen only works where the game takes it (the title and the lab hub ignore it), so the mouse also drives them like a pad:
-    if (eff.mouse_buttons & (1u << kMouseLeft)) out.buttons |= 1ull << kA;    //   left click = A (confirm the focused item)
-    if (eff.mouse_buttons & (1u << kMouseRight)) out.buttons |= 1ull << kB;   //   right click = B (back)
-    if (eff.mouse_buttons & (1u << kMouseWheelUp)) out.buttons |= 1ull << kUp;       //   wheel = move the focus up / down
-    if (eff.mouse_buttons & (1u << kMouseWheelDown)) out.buttons |= 1ull << kDown;
+  if (eff.focused && !eff.in_ride && m.mouse_touch) {   // menus: left click = A (+ TouchSample), right click = B (upstream v1.4.0 / QA8 behavior)
+    if (eff.mouse_buttons & (1u << kMouseLeft)) out.buttons |= 1ull << kA;
+    if (eff.mouse_buttons & (1u << kMouseRight)) out.buttons |= 1ull << kB;
   }
   if (m.mouse_look && eff.focused && eff.in_ride) {   // mouse-look click bindings, ride only: menus keep the touch screen / pad flow
     if (any_down(m.look_a, eff, 0.5f)) out.buttons |= 1ull << kA;
@@ -612,14 +761,60 @@ PadSample map_pad(const Mapping& m, const RawInput& in) {
   float lx, ly, rx, ry;
   stick_value(m.left, true, m, eff, 0, 0, &lx, &ly);
   float mlx = 0, mly = 0;
-  if (m.mouse_look && eff.focused && eff.in_ride) {   // mouse aim only on a ride: menus keep a free cursor
-    mlx = std::clamp(eff.mouse_vx * m.mouse_sensitivity / (float)kMouseLookFullPxPerSec, -1.0f, 1.0f) * (m.mouse_invert_x ? -1.f : 1.f);
-    mly = std::clamp(-eff.mouse_vy * m.mouse_sensitivity / (float)kMouseLookFullPxPerSec, -1.0f, 1.0f) * (m.mouse_invert_y ? -1.f : 1.f);
+  if (m.mouse_look && eff.focused && eff.in_ride && !aot_camera_enabled()) {   // mouse aim only on a ride: menus keep a free cursor (suppressed when AOT camera handles deltas directly)
+    const float sx = m.mouse_sensitivity * m.mouse_sens_x;
+    const float sy = m.mouse_sensitivity * m.mouse_sens_y;
+    const bool has_vel = (eff.mouse_vx != 0.0f || eff.mouse_vy != 0.0f);
+    const float vx = has_vel ? eff.mouse_vx : (eff.mouse_frame_dx * 60.0f);
+    const float vy = has_vel ? eff.mouse_vy : (eff.mouse_frame_dy * 60.0f);
+    const char* ds_env = std::getenv("SNAP_MOUSE_DUAL_STICK");
+    const bool dual_stick = (ds_env && std::atoi(ds_env) != 0);
+    float dual_gain = 1.0f;
+    if (dual_stick) {
+      const bool zl_toggle = (toggle_mask_effective(m) & (1u << kZL)) != 0;
+      const bool zoom_active = zl_toggle ? eff.zoom_latched : ((out.buttons & (1ull << kZL)) != 0);
+      if (zoom_active) {
+        dual_gain = 2.20f;  // QA23: validated independent zoom sensitivity (configurable via SNAP_MOUSE_DUAL_ZOOM_GAIN)
+        if (const char* zg = std::getenv("SNAP_MOUSE_DUAL_ZOOM_GAIN")) {
+          const float parsed = (float)std::atof(zg);
+          if (std::isfinite(parsed) && parsed > 0.0f) dual_gain = std::clamp(parsed, 0.25f, 4.0f);
+        }
+      } else {
+        dual_gain = 1.70f;  // QA23: experimental normal Dual-Stick gain (configurable via SNAP_MOUSE_DUAL_GAIN)
+        if (const char* dg = std::getenv("SNAP_MOUSE_DUAL_GAIN")) {
+          const float parsed = (float)std::atof(dg);
+          if (std::isfinite(parsed) && parsed > 0.0f) dual_gain = std::clamp(parsed, 0.25f, 3.0f);
+        }
+      }
+    }
+    const float pre_x = (vx * sx * dual_gain / (float)kMouseLookFullPxPerSec) * (m.mouse_invert_x ? -1.f : 1.f);
+    const float pre_y = (-vy * sy * dual_gain / (float)kMouseLookFullPxPerSec) * (m.mouse_invert_y ? -1.f : 1.f);
+    // Radial response curve: preserves slow precision (0..0.5) while extending fast proportionality up to 2400 px/s,
+    // and clamps radially so movement angle is never distorted.
+    const float mmag = std::sqrt(pre_x * pre_x + pre_y * pre_y);
+    if (mmag > 1e-6f) {
+      const float target_mag = (mmag < 0.5f)
+                                   ? (0.5f * std::pow(mmag * 2.0f, 0.72f))
+                                   : std::min(mmag, 1.0f);
+      const float dir_x = pre_x / mmag;
+      const float dir_y = pre_y / mmag;
+      mlx = dir_x * target_mag;
+      mly = dir_y * target_mag;
+      if (dual_stick && mmag > 1.0f) {
+        // Two-Stage Split Radial: overflow above Right Stick capacity goes to Left Stick along the exact same vector,
+        // unless physical Left Stick or WASD is active (in which case split yields immediately).
+        if (std::fabs(lx) <= 1e-4f && std::fabs(ly) <= 1e-4f) {
+          const float excess = std::min(mmag - 1.0f, 1.0f);
+          lx = dir_x * excess;
+          ly = dir_y * excess;
+        }
+      }
+    }
   }
   const EnvFx& ev = env_fx();
   if (eff.gyro_present && (ev.gyro_set ? ev.gyro : pad_fx().gyro_on.load())) {
     float gx, gy;
-    gyro_to_stick(eff.gyro_y, eff.gyro_x, ev.sens_set ? ev.sens : pad_fx().gyro_sens.load(), pad_fx().gyro_invert_x.load(), pad_fx().gyro_invert_y.load(), &gx, &gy);
+    gyro_to_stick(eff.gyro_y, eff.gyro_x, ev.sens_set ? ev.sens : pad_fx().gyro_sens.load(), pad_fx().gyro_invert_x.load(), pad_fx().gyro_invert_y.load(), &gx, &gy, pad_fx().gyro_dead.load());
     mlx += gx; mly += gy;
   }
   stick_value(m.right, false, m, eff, mlx, mly, &rx, &ry);
@@ -1451,8 +1646,32 @@ void Hub::poll(int min_interval_ms) {
   std::lock_guard<std::mutex> g(mu_);
   if (!backend_) backend_ = make_default_backend();
   uint64_t t = now_ns();
+  // SNAP_INPUT_STATS=1: how the game reads input (log line every 5 s): reads of the pad per presented frame, how old the sample it got was
+  // (0 when the read polled the devices itself; the time since the last poll when the 1 ms throttle served it) and the mouse totals.
+  static const bool stats_on = [] { const char* e = std::getenv("SNAP_INPUT_STATS"); return e && *e && *e != '0'; }();
+  struct Stats { uint64_t t0 = 0, reads = 0, polls = 0, age_sum = 0, age_max = 0, mouse_events = 0, last_pres_ns = 0, phase_sum = 0, phase_n = 0; int pres0 = 0, last_pres = -1; double px = 0; };
+  static Stats st;
+  if (stats_on) {
+    if (!st.t0) { st.t0 = t; st.pres0 = (int)nvn::g_presentCount; }
+    ++st.reads;
+    const uint64_t age = last_poll_ns_ && t - last_poll_ns_ < (uint64_t)min_interval_ms * 1000000ull ? t - last_poll_ns_ : 0;
+    st.age_sum += age; st.age_max = std::max(st.age_max, age);
+    if ((int)nvn::g_presentCount != st.last_pres) {   // first read after a new present: how long after it
+      if (st.last_pres >= 0 && st.last_pres_ns) { st.phase_sum += t - st.last_pres_ns; ++st.phase_n; }
+      st.last_pres = (int)nvn::g_presentCount; st.last_pres_ns = t;
+    }
+    if (t - st.t0 >= 5000000000ull) {
+      const int pres = (int)nvn::g_presentCount - st.pres0;
+      log("input stats: %.1f s, %llu reads, %llu polls, %d presents (%.2f reads per present), sample age mean %.3f ms max %.3f ms, read after present mean %.3f ms, mouse %llu moves %.0f px",
+          (double)(t - st.t0) * 1e-9, (unsigned long long)st.reads, (unsigned long long)st.polls, pres, pres > 0 ? (double)st.reads / pres : 0.0,
+          st.reads ? (double)st.age_sum / st.reads * 1e-6 : 0.0, (double)st.age_max * 1e-6, st.phase_n ? (double)st.phase_sum / st.phase_n * 1e-6 : 0.0,
+          (unsigned long long)st.mouse_events, st.px);
+      st = Stats{}; st.t0 = t; st.pres0 = (int)nvn::g_presentCount; st.last_pres = (int)nvn::g_presentCount;
+    }
+  }
   if (last_poll_ns_ && t - last_poll_ns_ < (uint64_t)min_interval_ms * 1000000ull) return;
   last_poll_ns_ = t;
+  if (stats_on) ++st.polls;
   const bool open = menu_open_.load();
   const bool fcm = freecam::wants_mouse() && !open;   // the free camera flies with the mouse: confine and recenter the cursor like mouse-look
   const bool lock = (map_.lock_cursor && !open && (!map_.mouse_look || raw_.in_ride)) || fcm;   // mouse look confines the cursor on a ride only (menus: free cursor, touch screen)
@@ -1463,7 +1682,7 @@ void Hub::poll(int min_interval_ms) {
   if (g_script_gyro_on) { r.gyro_present = true; r.gyro_y = g_script_gyro_yaw; r.gyro_x = g_script_gyro_pitch; }   // scripted `gyro=` token (applied one poll late)
   if (env_fx().fake) { r.gyro_present = true; r.gyro_y = env_fx().fake_yaw; r.gyro_x = env_fx().fake_pitch; }   // SNAP_GYRO_FAKE
   cursor_hidden_ = recenter && r.focused;
-  {   // ride flag for the mouse-look click bindings, mouse aim and the Esc key (rail reports are off unless asked for)
+  {   // ride & UI scene flags (rail reports and UI scene open/close from rt_gm_neo_speed / rt_gm_route_ui_*)
     route_enable();
     std::lock_guard<std::mutex> rl(g_rs_mu);
     r.in_ride = g_rail_cur >= 0 && (int)nvn::g_presentCount - g_rail[g_rail_cur].f_adv <= 20;
@@ -1474,9 +1693,9 @@ void Hub::poll(int min_interval_ms) {
   r.mouse_buttons |= inject_.mouse_buttons | g_script_mouse;
   if (g_script_mpos_on) { r.mouse_in_window = true; r.mouse_x = g_script_mx; r.mouse_y = g_script_my; }
   if (inject_.pad.any() || g_script_pad.any()) r.pad_connected = true;
-  if (int d = g_wheel_delta.exchange(0)) {
-    if (d > 0) wheel_up_until_ns_ = t + 100000000ull; else wheel_down_until_ns_ = t + 100000000ull;
-  }
+  g_wheel_delta.exchange(0);
+  wheel_up_until_ns_ = 0;
+  wheel_down_until_ns_ = 0;
   {   // focus guard: switching to a snipping tool or another app must not press anything in the game when the window comes back
     static const bool guard_on = !(std::getenv("SNAP_FOCUS_GUARD") && std::atoi(std::getenv("SNAP_FOCUS_GUARD")) == 0);
     static const int kEsc = key_from_name("Escape");
@@ -1517,15 +1736,61 @@ void Hub::poll(int min_interval_ms) {
     if (pad_act) kbm_last = false; else if (kbm_act) kbm_last = true;
     icons::set_last_input(kbm_last);
   }
-  // mouse-look velocity: pixels moved over a window of 40 ms (smoothing off) up to 340 ms (smoothing 1)
-  if (r.focused && (r.mouse_dx != 0 || r.mouse_dy != 0)) msamples_.push_back({t, r.mouse_dx, r.mouse_dy});
-  {
-    const uint64_t win = (uint64_t)((0.04 + 0.30 * std::clamp(map_.mouse_smoothing, 0.0f, 1.0f)) * 1e9);
-    while (!msamples_.empty() && t - msamples_.front().t > 400000000ull) msamples_.erase(msamples_.begin());
-    double sx = 0, sy = 0;
-    for (auto& m : msamples_) if (t - m.t <= win) { sx += m.dx; sy += m.dy; }
-    r.mouse_vx = (float)(sx / ((double)win * 1e-9));
-    r.mouse_vy = (float)(sy / ((double)win * 1e-9));
+  // mouse-look per-frame displacement: consumed once per nvn::g_presentCount frame, never reused across frames.
+  if (stats_on && (r.mouse_dx != 0 || r.mouse_dy != 0)) { ++st.mouse_events; st.px += std::fabs(r.mouse_dx) + std::fabs(r.mouse_dy); }
+  const int cur_present = (int)nvn::g_presentCount;
+  const bool new_present = (cur_present != last_mouse_present_);
+  if (!r.focused) {
+    frame_dx_ = 0.0f;
+    frame_dy_ = 0.0f;
+    frame_dt_s_ = 1.0f / 60.0f;
+    sm_dx_ = 0.0f;
+    sm_dy_ = 0.0f;
+    sm_mouse_ns_ = 0;
+    last_mouse_present_ = cur_present;
+    last_mouse_present_ns_ = 0;
+  } else if (new_present) {
+    const float raw_dt = last_mouse_present_ns_ ? (float)(t - last_mouse_present_ns_) * 1e-9f : (1.0f / 60.0f);
+    frame_dt_s_ = (raw_dt >= 0.001f && raw_dt <= 0.1f) ? raw_dt : (1.0f / 60.0f);
+    last_mouse_present_ns_ = t;
+    frame_dx_ = r.mouse_dx;
+    frame_dy_ = r.mouse_dy;
+    last_mouse_present_ = cur_present;
+  } else if (r.mouse_dx != 0.0f || r.mouse_dy != 0.0f) {
+    // Accumulate deltas in the same direction; on rapid reversal after strong motion (>=16 px then >=8 px opposite), drop stale delta.
+    if ((frame_dx_ >= 16.0f && r.mouse_dx <= -8.0f) || (frame_dx_ <= -16.0f && r.mouse_dx >= 8.0f)) frame_dx_ = r.mouse_dx;
+    else frame_dx_ += r.mouse_dx;
+    if ((frame_dy_ >= 16.0f && r.mouse_dy <= -8.0f) || (frame_dy_ <= -16.0f && r.mouse_dy >= 8.0f)) frame_dy_ = r.mouse_dy;
+    else frame_dy_ += r.mouse_dy;
+  }
+  if (map_.mouse_smoothing <= 0.001f) {
+    r.mouse_frame_dx = r.focused ? frame_dx_ : 0.0f;
+    r.mouse_frame_dy = r.focused ? frame_dy_ : 0.0f;
+    sm_dx_ = 0.0f;
+    sm_dy_ = 0.0f;
+    sm_mouse_ns_ = 0;
+  } else {
+    if (new_present || sm_mouse_ns_ == 0) {
+      const float dt = sm_mouse_ns_ ? (float)(t - sm_mouse_ns_) * 1e-9f : (1.0f / 60.0f);
+      const float tau = std::clamp(map_.mouse_smoothing, 0.0f, 1.0f) * 0.06f;
+      sm_dx_ = ema_step(sm_dx_, r.focused ? frame_dx_ : 0.0f, dt > 0.25f ? 1.0f : dt, dt > 0.25f ? 0.0f : tau);
+      sm_dy_ = ema_step(sm_dy_, r.focused ? frame_dy_ : 0.0f, dt > 0.25f ? 1.0f : dt, dt > 0.25f ? 0.0f : tau);
+      sm_mouse_ns_ = t;
+    }
+    r.mouse_frame_dx = sm_dx_;
+    r.mouse_frame_dy = sm_dy_;
+  }
+  r.mouse_vx = r.mouse_frame_dx / frame_dt_s_;
+  r.mouse_vy = r.mouse_frame_dy / frame_dt_s_;
+  {   // gyro smoothing (off by default): a one-pole filter on the rate, time constant up to 60 ms
+    const float sm = std::clamp(pad_fx().gyro_smooth.load(), 0.0f, 1.0f);
+    if (r.gyro_present && sm > 0.0f) {
+      const float dt = gyro_sm_t_ ? (float)(t - gyro_sm_t_) * 1e-9f : 1.0f;
+      gyro_sm_x_ = ema_step(gyro_sm_x_, r.gyro_x, dt > 0.25f ? 1.0f : dt, dt > 0.25f ? 0.0f : sm * 0.06f);
+      gyro_sm_y_ = ema_step(gyro_sm_y_, r.gyro_y, dt > 0.25f ? 1.0f : dt, dt > 0.25f ? 0.0f : sm * 0.06f);
+      r.gyro_x = gyro_sm_x_; r.gyro_y = gyro_sm_y_;
+      gyro_sm_t_ = t;
+    } else { gyro_sm_t_ = 0; }
   }
   raw_ = r;
   icons::set_pad((icons::Family)r.pad_family, r.pad_connected);
@@ -1565,6 +1830,7 @@ void Hub::poll(int min_interval_ms) {
       else if (t > cap_deadline_ns_) { capturing_ = false; cap_timeout_ = true; }
     }
   }
+  r.zoom_latched = (tog_state_ & (1ull << kZL)) != 0;
   PadSample p = map_pad(map_, r);
   {   // SNAP_FOCUS_GUARD_LOG=1 (tests): every Plus and B press the game is about to see, with the focus state
     static const bool plog = std::getenv("SNAP_FOCUS_GUARD_LOG") != nullptr;
@@ -1611,6 +1877,56 @@ void Hub::poll(int min_interval_ms) {
     if (inj && std::chrono::steady_clock::now().time_since_epoch().count() < g_inject_until_ns.load(std::memory_order_relaxed)) { pad_.buttons |= inj; pad_.connected = true; }
   }
   freecam::poll(r, pad_, touch_, open, t);   // free camera on: hotkeys, accumulated movement, and an idle pad for the game
+  if (aot_camera_enabled()) {
+    if (map_.mouse_look && r.focused && r.in_ride && !open) {
+      const float sx = map_.mouse_sensitivity * map_.mouse_sens_x * (map_.mouse_invert_x ? -1.0f : 1.0f);
+      const float sy = map_.mouse_sensitivity * map_.mouse_sens_y * (map_.mouse_invert_y ? -1.0f : 1.0f);
+      const bool zoom_on = (pad_.buttons & (1ull << kZL)) != 0;
+      post_aot_mouse_delta(r.mouse_dx * sx, r.mouse_dy * sy, zoom_on);
+    } else {
+      reset_aot_mouse_delta();
+    }
+  }
+  g_ui_in_ride.store(r.in_ride, std::memory_order_relaxed);
+  g_ui_menu_open.store(open, std::memory_order_relaxed);
+  g_ui_focused.store(r.focused, std::memory_order_relaxed);
+  const bool stick_or_dpad =
+      std::fabs((float)pad_.lx) > (float)kStickMax * 0.12f ||
+      std::fabs((float)pad_.ly) > (float)kStickMax * 0.12f ||
+      (pad_.buttons & ((1ull << kUp) | (1ull << kDown) | (1ull << kLeft) | (1ull << kRight))) != 0;
+  if (r.in_ride || open || !r.focused || stick_or_dpad) {
+    g_mouse_ui_active.store(false, std::memory_order_relaxed);
+  }
+  {
+    static const bool dbg = std::getenv("SNAP_MOUSE_DEBUG") && std::atoi(std::getenv("SNAP_MOUSE_DEBUG")) != 0;
+    if (dbg) {
+      static int dbg_n = 0;
+      const bool ride_move = r.in_ride && (r.mouse_dx != 0.0f || r.mouse_dy != 0.0f || r.mouse_frame_dx != 0.0f || r.mouse_frame_dy != 0.0f);
+      if (ride_move) {
+        const float sx = map_.mouse_sensitivity * map_.mouse_sens_x;
+        const float sy = map_.mouse_sensitivity * map_.mouse_sens_y;
+        const float pre_x = (r.mouse_vx * sx / (float)kMouseLookFullPxPerSec) * (map_.mouse_invert_x ? -1.f : 1.f);
+        const float pre_y = (-r.mouse_vy * sy / (float)kMouseLookFullPxPerSec) * (map_.mouse_invert_y ? -1.f : 1.f);
+        const float pmag = std::sqrt(pre_x * pre_x + pre_y * pre_y);
+        const float post_x = pmag > 1.0f ? (pre_x / pmag) : pre_x;
+        const float post_y = pmag > 1.0f ? (pre_y / pmag) : pre_y;
+        const float ang_vel = std::atan2(-r.mouse_vy, r.mouse_vx) * 57.2957795f;
+        const float ang_hid = (pad_.rx != 0 || pad_.ry != 0) ? (std::atan2((float)pad_.ry, (float)pad_.rx) * 57.2957795f) : 0.0f;
+        const char* ds_env = std::getenv("SNAP_MOUSE_DUAL_STICK");
+        const int dual_on = (ds_env && std::atoi(ds_env) != 0) ? 1 : 0;
+        const int zoom_on = (pad_.buttons & (1ull << kZL)) ? 1 : 0;
+        log("mouse_dbg[pipe]: ts_ns=%llu pres=%d ev=%u dual=%d zoom=%d accum=(%.1f,%.1f) frame=(%.1f,%.1f) dt=%.4f vel=(%.1f,%.1f) pre=(%.3f,%.3f) post=(%.3f,%.3f) hid_r=(%d,%d) hid_l=(%d,%d) ang_vel=%.1f ang_hid=%.1f",
+            (unsigned long long)t, cur_present, (unsigned)r.mouse_poll_events, dual_on, zoom_on,
+            r.mouse_dx, r.mouse_dy, r.mouse_frame_dx, r.mouse_frame_dy, frame_dt_s_,
+            r.mouse_vx, r.mouse_vy, pre_x, pre_y, post_x, post_y,
+            (int)pad_.rx, (int)pad_.ry, (int)pad_.lx, (int)pad_.ly, ang_vel, ang_hid);
+      } else if ((dbg_n++ % 60) == 0 || touch_.count > 0) {
+        log("mouse_dbg[hub]: in_ride=%d focused=%d norm=(%.3f,%.3f) in_win=%d btn=%#x rx=%d ry=%d touch=(cnt=%d %d,%d)",
+            (int)r.in_ride, (int)r.focused, r.mouse_x, r.mouse_y, (int)r.mouse_in_window, (unsigned)r.mouse_buttons,
+            (int)pad_.rx, (int)pad_.ry, (int)touch_.count, (int)touch_.pt[0].x, (int)touch_.pt[0].y);
+      }
+    }
+  }
   ++seq_;
 }
 PadSample Hub::pad() const { std::lock_guard<std::mutex> g(mu_); return pad_; }
@@ -1645,3 +1961,7 @@ Hub& hub() {
 }
 
 }  // namespace hle::input
+
+extern "C" bool snap_ui_pointer_1080(float* gx, float* gy) {
+  return hle::input::ui_pointer_1080(gx, gy);
+}

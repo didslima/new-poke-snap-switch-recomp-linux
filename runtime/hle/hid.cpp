@@ -131,7 +131,8 @@ void hid_get_touch_screen_state6(Cpu* c) {
       }
     }
     if (sn == last_sn && cached_attr && cached_count) {   // SNAP_TOUCH_LOG=1: each touch start / end the game is shown (panel pixels, 1280x720)
-      static const bool tlog = std::getenv("SNAP_TOUCH_LOG") != nullptr;
+      static const bool tlog = std::getenv("SNAP_TOUCH_LOG") != nullptr ||
+                               (std::getenv("SNAP_MOUSE_DEBUG") && std::atoi(std::getenv("SNAP_MOUSE_DEBUG")) != 0);
       static int64_t logged_sn = -1;
       if (tlog && logged_sn != sn) { logged_sn = sn; log("hid: touch %s at %d,%d (sample %lld)", cached_attr == 1 ? "start" : "end", (int)cached_pt.x, (int)cached_pt.y, (long long)sn); }
     }

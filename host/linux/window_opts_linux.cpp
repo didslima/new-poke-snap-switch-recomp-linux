@@ -343,3 +343,72 @@ int snap_window_focused(void) { return snap_linux::g_focused.load(std::memory_or
 int snap_window_paused(void) { return snap_linux::g_paused.load(std::memory_order_acquire) ? 1 : 0; }
 
 }  // extern "C"
+
+extern "C" {
+__attribute__((weak)) void nvnHostSetFramePacing(double) {}
+__attribute__((weak)) const char* snap_vsync_get() { return "on"; }
+__attribute__((weak)) void snap_vsync_set(const char*) {}
+}
+
+namespace snap_linux {
+
+bool fast_boot_on_present(uint64_t present_num, double restore_hz, const FastBootHooks* hooks, bool reset) {
+  static int s_frames = -1;
+  static bool s_drop_vsync = true;
+  static std::string s_saved_vsync;
+  static bool s_active = false;
+  if (reset) {
+    s_frames = -1;
+    s_drop_vsync = true;
+    s_saved_vsync.clear();
+    s_active = false;
+  }
+  if (s_frames < 0) {
+    const char* e = std::getenv("SNAP_FAST_BOOT");
+    if (e && *e && std::strcmp(e, "0") != 0) {
+      const char* f = std::getenv("SNAP_FAST_BOOT_FRAMES");
+      const int v = f ? std::atoi(f) : 3200;
+      s_frames = v > 0 ? v : 3200;
+    } else {
+      s_frames = 0;
+    }
+    const char* dv = std::getenv("SNAP_FAST_BOOT_VSYNC");
+    s_drop_vsync = !(dv && *dv == '0');
+  }
+  if (s_frames <= 0) return false;
+
+  auto set_pacing = (hooks && hooks->set_pacing) ? hooks->set_pacing : nvnHostSetFramePacing;
+  auto get_vsync = (hooks && hooks->get_vsync) ? hooks->get_vsync : snap_vsync_get;
+  auto set_vsync = (hooks && hooks->set_vsync) ? hooks->set_vsync : snap_vsync_set;
+
+  if (present_num == 1) {
+    set_pacing(0.0);
+    s_active = true;
+    s_saved_vsync.clear();
+    if (s_drop_vsync && get_vsync && set_vsync) {
+      const char* cur = get_vsync();
+      if (cur && (std::strcmp(cur, "on") == 0 || std::strcmp(cur, "adaptive") == 0)) {
+        s_saved_vsync = cur;
+        set_vsync("off");
+      }
+    }
+    std::fprintf(stderr, "[window] fast boot: frame limiter off for %d presents%s\n", s_frames,
+                 s_saved_vsync.empty() ? "" : ", vsync off");
+    return true;
+  }
+  if (present_num == static_cast<uint64_t>(s_frames)) {
+    set_pacing(restore_hz > 0.0 ? restore_hz : 60.0);
+    if (!s_saved_vsync.empty() && set_vsync) {
+      set_vsync(s_saved_vsync.c_str());
+    }
+    std::fprintf(stderr, "[window] fast boot: frame limiter back to %.0f Hz%s at present %llu\n",
+                 restore_hz > 0.0 ? restore_hz : 60.0, s_saved_vsync.empty() ? "" : " and vsync restored",
+                 static_cast<unsigned long long>(present_num));
+    s_saved_vsync.clear();
+    s_active = false;
+    return false;
+  }
+  return s_active && present_num < static_cast<uint64_t>(s_frames);
+}
+
+}  // namespace snap_linux

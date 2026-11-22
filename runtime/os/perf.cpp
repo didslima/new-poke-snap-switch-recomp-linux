@@ -2,12 +2,14 @@
 #include "perf.h"
 
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "os.h"
 #include "os_host.h"
@@ -61,7 +63,10 @@ static void crit_dump(uint64_t t0) {
 }
 void ledger_register() {
     tl_ledger.tid = osk::host::thread_id();
-    std::lock_guard<std::mutex> lk(g_led_mu);
+    // Often called from wait_add while the scheduler lock G is held: never block on g_led_mu here. On contention leave reg false;
+    // the next wait_add retries (the ns counters already accumulate in tl_ledger, so nothing is lost).
+    std::unique_lock<std::mutex> lk(g_led_mu, std::try_to_lock);
+    if (!lk.owns_lock()) return;
     g_ledgers[tl_ledger.tid] = &tl_ledger;
     tl_ledger.reg = true;
 }
@@ -88,6 +93,32 @@ static OsStats g_prev_os;
 static uint64_t g_prev_cycles;
 static std::once_flag g_once;
 
+// Events are pushed into a small ring under a spinlock held only for the copy, and written to the file by the sampler (once a second)
+// and frame_mark. note_wait and acquire_core report events while holding the scheduler lock G; event() used to take g_ev_mu,
+// which frame_mark and the sampler hold across fprintf/fflush, so a slow disk write could stall every core handoff.
+// SNAP_PERF_EVENT_SYNC=1 writes each event at once under g_ev_mu, as before.
+struct EvRec { uint64_t ns; double ms; char kind[24]; char det[336]; };
+static constexpr uint32_t kEvRing = 512;
+static EvRec g_ev_ring[kEvRing], g_ev_out[kEvRing];
+static std::atomic_flag g_ev_push = ATOMIC_FLAG_INIT;
+static uint32_t g_ev_head, g_ev_tail;   // head: next write, tail: next read (free-running)
+static uint64_t g_ev_dropped, g_ev_dropped_written;
+static const bool g_ev_sync = [] { const char* e = std::getenv("SNAP_PERF_EVENT_SYNC"); return e && *e == '1'; }();
+static void ev_drain_locked() {   // caller holds g_ev_mu
+    uint32_t n = 0;
+    while (g_ev_push.test_and_set(std::memory_order_acquire)) {}
+    while (g_ev_tail != g_ev_head) g_ev_out[n++] = g_ev_ring[g_ev_tail++ % kEvRing];
+    const uint64_t dropped = g_ev_dropped;
+    g_ev_push.clear(std::memory_order_release);
+    if (!g_events) return;
+    for (uint32_t i = 0; i < n; i++)
+        fprintf(g_events, "%.3f,%s,%.3f,%s\n", (double)(g_ev_out[i].ns - g_t0) / 1e9, g_ev_out[i].kind, g_ev_out[i].ms, g_ev_out[i].det);
+    if (dropped != g_ev_dropped_written) {
+        fprintf(g_events, "%.3f,events_dropped,0,%llu\n", (double)(now_ns() - g_t0) / 1e9, (unsigned long long)(dropped - g_ev_dropped_written));
+        g_ev_dropped_written = dropped;
+    }
+}
+
 static void sampler() {
     std::map<uint32_t, uint64_t> last_cpu;   // tid -> cpu time at the previous sample (ns)
     uint64_t last = now_ns();
@@ -111,12 +142,21 @@ static void sampler() {
         }, &cx);
         if (g_waits) {   // per-thread blocked time over the last second (threads that waited 1 ms or more)
             static std::map<unsigned long, std::array<uint64_t, WT_COUNT>> prev;
-            std::lock_guard<std::mutex> lk(g_led_mu);
-            for (auto& [tid, l] : g_ledgers) {
+            // copy the counters under g_led_mu, then format and print with it released
+            std::vector<std::pair<unsigned long, std::array<uint64_t, WT_COUNT>>> snapLed;
+            {
+                std::lock_guard<std::mutex> lk(g_led_mu);
+                for (auto& [tid, l] : g_ledgers) {
+                    std::array<uint64_t, WT_COUNT> a;
+                    for (int i = 0; i < WT_COUNT; i++) a[i] = l->ns[i].load(std::memory_order_relaxed);
+                    snapLed.emplace_back(tid, a);
+                }
+            }
+            for (auto& [tid, cur] : snapLed) {
                 auto& pv = prev[tid];
                 uint64_t d[WT_COUNT], sum = 0;
                 for (int i = 0; i < WT_COUNT; i++) {
-                    const uint64_t v = l->ns[i].load(std::memory_order_relaxed);
+                    const uint64_t v = cur[i];
                     d[i] = v - pv[i];
                     pv[i] = v;
                     sum += d[i];
@@ -137,7 +177,9 @@ static void sampler() {
             fflush(g_waits);
         }
         std::lock_guard<std::mutex> lk(g_ev_mu);
+        ev_drain_locked();
         fflush(g_threads);
+        fflush(g_events);
     }
 }
 
@@ -229,15 +271,37 @@ void frame_mark(uint64_t present_no, double gpu_busy_ms, double gpu_span_ms, int
     const uint64_t ce = g_cs_elided.load(std::memory_order_relaxed), cf = g_cs_forced.load(std::memory_order_relaxed);
     fprintf(g_frames, ",%llu,%llu,%llu\n", (unsigned long long)(fb - g_prev_fs_bytes), (unsigned long long)(ce - g_prev_cs_elided), (unsigned long long)(cf - g_prev_cs_forced));
     g_prev_fs_bytes = fb; g_prev_cs_elided = ce; g_prev_cs_forced = cf;
-    if (present_no % 120 == 0) { fflush(g_frames); fflush(g_events); }
+    {
+        std::lock_guard<std::mutex> lk(g_ev_mu);
+        ev_drain_locked();
+        if (present_no % 120 == 0) fflush(g_events);
+    }
+    if (present_no % 120 == 0) fflush(g_frames);
 }
 
 void event(const char* kind, double ms, const char* detail) {
     if (!on) return;
     std::call_once(g_once, init);
     if (!g_events) return;
-    std::lock_guard<std::mutex> lk(g_ev_mu);
-    fprintf(g_events, "%.3f,%s,%.3f,%s\n", (double)(now_ns() - g_t0) / 1e9, kind, ms, detail ? detail : "");
+    if (g_ev_sync) {
+        std::lock_guard<std::mutex> lk(g_ev_mu);
+        fprintf(g_events, "%.3f,%s,%.3f,%s\n", (double)(now_ns() - g_t0) / 1e9, kind, ms, detail ? detail : "");
+        return;
+    }
+    const uint64_t t = now_ns();
+    while (g_ev_push.test_and_set(std::memory_order_acquire)) {}
+    if (g_ev_head - g_ev_tail >= kEvRing) {
+        g_ev_dropped++;
+    } else {
+        EvRec& r = g_ev_ring[g_ev_head++ % kEvRing];
+        r.ns = t;
+        r.ms = ms;
+        std::strncpy(r.kind, kind ? kind : "", sizeof r.kind - 1);
+        r.kind[sizeof r.kind - 1] = 0;
+        std::strncpy(r.det, detail ? detail : "", sizeof r.det - 1);
+        r.det[sizeof r.det - 1] = 0;
+    }
+    g_ev_push.clear(std::memory_order_release);
 }
 
 }  // namespace snap_perf

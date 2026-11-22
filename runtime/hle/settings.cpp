@@ -121,12 +121,15 @@ const struct { const char* key; const char* env; } kEnvKeys[] = {
     {"hud_scale", "SNAP_HUD_SCALE"},            // auto | 100 | 125 | 150 | 175 | 200 (runtime/nvn/nvn_hud.cpp)
     {"frame_generation", "SNAP_FRAMEGEN"},   // Frame generation row ("fsr" or the older "1" = FSR, "dlss" = NVIDIA DLSS, unset = off; runtime/nvn/nvn_framegen.cpp; restart)
     {"foliage_aa", "SNAP_FOLIAGE_AA"}, {"leaf_translucency", "SNAP_LEAF_TRANSLUCENCY"}, {"soft_particles", "SNAP_SOFT_PARTICLES"},   // foliage / particle rows (runtime/nvn/nvn_foliage.cpp; restart)
+    {"specular_aa", "SNAP_SPECULAR_AA"},   // image stability row (runtime/nvn/nvn_motionaa.cpp; live)
+    {"gfx_hd_effects", "SNAP_HD_EFFECTS"},   // HD effects (runtime/nvn/nvn_hdfx.cpp; live, default Off on Linux)
     {"gfx_pom", "SNAP_POM"},   // Parallax detail row (off | low | high; runtime/nvn/nvn_pom.cpp, docs/pom.md; restart)
     {"gfx_bokeh_dof", "SNAP_BOKEH_DOF"}, {"gfx_motion_blur", "SNAP_MOTION_BLUR"},   // lens effect rows (runtime/nvn/nvn_lens_fx.cpp; strength, unset = off; restart)
     {"spawn_rand", "SNAP_SPAWN_RAND"}, {"spawn_seed", "SNAP_SPAWN_SEED"},   // Spawn randomizer rows (off | within | all; seed text): read by scripts/mods/make_spawn_randomizer.py, which builds the pack
     {"game_language", "SNAP_GAME_LANGUAGE"},   // Game language row: ja | en | fr | de | it | es | ko | zh-hans | zh-hant, unset = Auto (Windows language, else English); docs/player-options.md
     {"fps_target", "SNAP_FPS"},   // Frame rate target row (72 / 90 / 120 / 144 / 165 / 240; "default" = 60, the game's own); host/mods/highfps.cpp, uipace.cpp
     {"access_cvd", "SNAP_ACCESS_CVD"}, {"access_cvd_strength", "SNAP_ACCESS_CVD_STRENGTH"}, {"access_ui_size", "SNAP_ACCESS_UI_SIZE"}, {"access_contrast", "SNAP_ACCESS_CONTRAST"},   // Accessibility rows (hle/access.h, docs/accessibility.md); live through hle::access::set
+    {"audio_latency", "SNAP_AUDIO_LATENCY"}, {"audio_resampler", "SNAP_AUDIO_RESAMPLER"}, {"audio_range", "SNAP_AUDIO_RANGE"}, {"audio_device", "SNAP_AUDIO_DEVICE"},
     {"access_flash", "SNAP_ACCESS_FLASH"}, {"access_mono", "SNAP_ACCESS_MONO"}, {"access_toggle", "SNAP_ACCESS_TOGGLE"},   // access_toggle: comma list of buttons that toggle (read at start, hle/input_core.cpp)
 };
 
@@ -146,6 +149,7 @@ const char* const kLiveKeys[] = {
     "ssao_quality", "gfx_ssao_samples", "gfx_ssao_hbao",                                         // host/mods/gamemods.cpp
     "gfx_lighting", "gfx_bounce", "gfx_shadow_dist",                                             // hle/lighting_preset.h, nvn_lighting_fx.cpp, nvn_shadowpcf.cpp, nvn_draw.cpp
     "foliage_aa", "leaf_translucency", "gfx_pom",                                                // nvn_foliage.cpp, nvn_pom.cpp
+    "specular_aa", "gfx_hd_effects",                                                             // nvn_motionaa.cpp, nvn_hdfx.cpp
     "gfx_lod_bias", "gfx_aniso",                                                                 // nvn_gfx.cpp (samplers are made again)
     "gfx_lod_dist", "gfx_lod_force0", "gfx_draw_dist", "gfx_full_rate_anim",                     // host/mods/lodanim.cpp
     "fps_target",                                                                                // host/mods/highfps.cpp
@@ -184,7 +188,8 @@ namespace {
 // Safe mode keeps only settings that do not change what is drawn or loaded: language, accessibility, input feel, HUD size, window size.
 bool safe_keeps(const std::string& k) {
   static const char* const kKeep[] = {"game_language", "return_to_launcher", "hud_scale", "gfx_ui_font", "swap_ab", "button_icons", "win_size",
-                                      "gyro_on", "gyro_sens", "gyro_invert_x", "gyro_invert_y", "rumble_on", "rumble_strength"};
+                                      "gyro_on", "gyro_sens", "gyro_invert_x", "gyro_invert_y", "rumble_on", "rumble_strength",
+                                      "stick_curve", "stick_deadzone", "gyro_smooth", "gyro_dead", "gyro_avg", "raw_mouse", "mouse_window_ms"};
   if (k.compare(0, 7, "access_") == 0) return true;
   for (const char* n : kKeep) if (k == n) return true;
   return false;
@@ -309,6 +314,22 @@ void apply(bool env) {
   fx.gyro_invert_y = get_bool("gyro_invert_y", false);
   fx.rumble_on = get_bool("rumble_on", true);
   fx.rumble_strength = get_float("rumble_strength", 1.0f);
+  {
+    auto val = [&](const char* envn, const char* key, const char* def) {
+      const char* e = std::getenv(envn);
+      return e && *e ? std::string(e) : get(key, def);
+    };
+    auto num = [&](const char* envn, const char* key, float def) { const std::string s = val(envn, key, ""); return s.empty() ? def : (float)std::atof(s.c_str()); };
+    auto flag = [&](const char* envn, const char* key) { const std::string s = val(envn, key, "0"); return !(s.empty() || s == "0" || s == "off"); };
+    fx.stick_curve = input::stick_curve_from_name(val("SNAP_STICK_CURVE", "stick_curve", "linear"));
+    const float dz = num("SNAP_STICK_DEADZONE", "stick_deadzone", -1.0f);
+    fx.stick_deadzone = dz < 0.0f ? -1.0f : std::min(dz, 0.6f);
+    fx.gyro_smooth = std::clamp(num("SNAP_GYRO_SMOOTH", "gyro_smooth", 0.0f), 0.0f, 1.0f);
+    fx.gyro_dead = std::clamp(num("SNAP_GYRO_DEAD", "gyro_dead", input::kGyroDeadDegPerSecDefault), 0.0f, 10.0f);
+    fx.gyro_avg = flag("SNAP_GYRO_AVG", "gyro_avg");
+    fx.raw_mouse = flag("SNAP_RAW_MOUSE", "raw_mouse");
+    fx.mouse_window_ms = std::clamp(num("SNAP_MOUSE_WINDOW_MS", "mouse_window_ms", 40.0f), 8.0f, 80.0f);
+  }
   {   // A/B swap (confirm and back on the controller; docs/player-options.md): SNAP_SWAP_AB (1 / 0) beats the swap_ab setting; neither set follows input.json "controller.swap_ab". Live; the prompts' icons follow.
     const char* e = std::getenv("SNAP_SWAP_AB");
     const std::string v = e && *e ? std::string(e) : get("swap_ab", "");

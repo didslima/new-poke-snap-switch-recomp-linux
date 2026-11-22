@@ -348,6 +348,32 @@ std::string get_audio_out() {
 void set_audio_out(const std::string& v) {
   snap_audio_set_output(v == "speakers" ? SNAP_AUDIO_OUT_SPEAKERS : v == "spatial" ? SNAP_AUDIO_OUT_SPATIAL : SNAP_AUDIO_OUT_STEREO, -1, -1);
 }
+std::string get_audio_range() { const int r = snap_audio_get_range(); return r == SNAP_AUDIO_RANGE_NIGHT ? "night" : r == SNAP_AUDIO_RANGE_REDUCED ? "reduced" : "full"; }
+void set_audio_range(const std::string& v) {
+  if (v == "full") st::erase("audio_range"); else st::set("audio_range", v);
+  snap_audio_set_range(v == "night" ? SNAP_AUDIO_RANGE_NIGHT : v == "reduced" ? SNAP_AUDIO_RANGE_REDUCED : SNAP_AUDIO_RANGE_FULL);
+}
+Choices audio_devices() {
+  static std::mutex mu;
+  static Choices cached{{"default", "System default"}};
+  static std::atomic<bool> busy{false};
+  static double last = -100;
+  const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (now - last > 10.0 && !busy.exchange(true)) {
+    last = now;
+    std::thread([] {
+      char buf[4096];
+      const int n = snap_audio_list_devices(buf, (int)sizeof buf);
+      Choices c{{"default", "System default"}};
+      const char* p = buf;
+      for (int i = 0; i < n && *p; ++i) { const std::string nm = p; c.push_back({nm, nm}); p += nm.size() + 1; }
+      { std::lock_guard<std::mutex> g(mu); cached = c; }
+      busy = false;
+    }).detach();
+  }
+  std::lock_guard<std::mutex> g(mu);
+  return cached;
+}
 // The monitor list comes from EnumDisplayMonitors, which can be slow (and stalls the presenting thread) on some desktops: enumerate on a worker thread, at most
 // every 10 s, and draw the last result.
 Choices monitors() {
@@ -442,6 +468,9 @@ std::vector<Opt>& graphics_opts() {
       {"foliage_aa", "Leaf edge smoothing", kChoice, kLive,
        "Smooths the jagged edges of leaves and grass, which the game cuts out with a hard test that anti-aliasing cannot reach. Works best with Anti-aliasing or a render scale above 1. Photos are unchanged.", "default",
        {{"default", "Off (the game's own)"}, {"1", "On"}}, 0, 0, "", "SNAP_FOLIAGE_AA"},
+      {"specular_aa", "Specular sparkle filter", kChoice, kLive,
+       "Tames isolated one-pixel specular glints that shimmer when the camera moves (runtime/nvn/nvn_motionaa.cpp). Display only; photos and scores are unchanged.", "default",
+       {{"default", "Off (the game's own)"}, {"1", "On"}}, 0, 0, "", "SNAP_SPECULAR_AA"},
       {"leaf_translucency", "Leaf translucency", kChoice, kLive,
        "Sunlight glows through leaves when you look at them from the shade side. Off is the game's own look. Photos are unchanged.", "default",
        {{"default", "Off (the game's own)"}, {"0.5", "Subtle"}, {"1", "Strong"}}, 0, 0, "", "SNAP_LEAF_TRANSLUCENCY"},
@@ -451,6 +480,9 @@ std::vector<Opt>& graphics_opts() {
       {"soft_particles", "Soft particles", kChoice, kRestart,
        "Dust, splashes and pollen fade out where they meet the ground and objects instead of cutting a hard line, and draw at full resolution. Photos are unchanged.", "default",
        {{"default", "Off (the game's own)"}, {"1", "On"}}, 0, 0, "", "SNAP_SOFT_PARTICLES"},
+      {"gfx_hd_effects", "HD effects", kChoice, kLive,
+       "Renders the half-size sea/particle layer at scene resolution and bloom at 2x (runtime/nvn/nvn_hdfx.cpp). Photos are unchanged.", "default",
+       {{"default", "Off (the game's own)"}, {"1", "On"}}, 0, 0, "", "SNAP_HD_EFFECTS"},
       // lens effects (runtime/nvn/nvn_lens_fx.cpp): display only, never in the photo or in anything photo scoring reads; restart to apply
       {"gfx_bokeh_dof", "Zoom bokeh", kChoice, kLive,
        "While you zoom, the background blurs into round bokeh like a telephoto lens, focused on what is under the reticle. The strength grows with the zoom and it is off when you are not zoomed. Photos stay sharp and scores are unchanged.", "default",
@@ -705,6 +737,18 @@ std::vector<Opt>& audio_opts() {
       {"audio_output", "Output mode", kChoice, kRestart,
        "Stereo is the game's own mix. Speakers sends 5.1 or 7.1 to a surround system (the stereo mix is spread around you). Spatial uses Windows Spatial Sound (Dolby Atmos, Windows Sonic) for headphones. The game opens its sound output once, so this needs a restart. Saved in audio.json.",
        "stereo", {{"stereo", "Stereo"}, {"speakers", "Speakers (5.1 / 7.1)"}, {"spatial", "Spatial (headphones)"}}, 0, 0, "", "SNAP_AUDIO_OUTPUT", get_audio_out, set_audio_out},
+      {"audio_device", "Output device", kChoice, kRestart,
+       "Which sound device the game plays on. System default follows the OS default output device.",
+       "default", {}, 0, 0, "", nullptr, nullptr, nullptr, audio_devices},
+      {"audio_latency", "Audio latency", kChoice, kRestart,
+       "Normal suits most PCs. Low gives the shortest delay between the game and your speakers but needs a free CPU. Safe uses a bigger buffer: pick it if you hear crackle or dropouts, or use Bluetooth.",
+       "normal", {{"low", "Low"}, {"normal", "Normal"}, {"safe", "Safe (fewer dropouts)"}}},
+      {"audio_resampler", "Sample-rate conversion", kChoice, kRestart,
+       "The game's sound is 48 kHz. If your device runs at 44.1 or 96 kHz, the system converts it (System default). Sinc uses the game's own high-quality converter, clean up to 20 kHz; Linear is lighter and a little duller. No effect on 48 kHz devices.",
+       "system", {{"system", "System default"}, {"sinc", "High quality (sinc)"}, {"linear", "Linear"}}},
+      {"audio_range", "Dynamic range", kChoice, kLive,
+       "Full is the game's own mix. Reduced narrows the gap between loud and quiet a little. Night mode narrows it a lot, so quiet sounds stay audible and loud ones do not wake the house.",
+       "full", {{"full", "Full"}, {"reduced", "Reduced"}, {"night", "Night mode"}}, 0, 0, "", "SNAP_AUDIO_RANGE", get_audio_range, set_audio_range},
   };
   return v;
 }

@@ -262,8 +262,11 @@ Boolean TextureInitialize(void* tex, const void* b) {
     if (!tag) for (int i = 0; i < nChain; i++) if (chain[i] == kGuestMain + kEvalDepthRet) tag = kTagEvalDepth;   // call-site tag
     t->scale = g_scale.For(*tb, tag);
     const float policyScale = t->scale;
-    { uint64_t rel[8]; for (int i = 0; i < nChain; i++) rel[i] = chain[i] - kGuestMain; t->scale *= FoliageParticleBoost(t, tb->width, tb->height, tb->format, rel, nChain); }   // [foliage] SNAP_SOFT_PARTICLES: full-resolution particle targets
-    RetargetNote(t, tag, policyScale > 0.f ? t->scale / policyScale : 1.0f);   // live size rows (nvn_retarget.cpp)
+    float folBoost = 1.0f;
+    { uint64_t rel[8]; for (int i = 0; i < nChain; i++) rel[i] = chain[i] - kGuestMain; folBoost = FoliageParticleBoost(t, tb->width, tb->height, tb->format, rel, nChain); }   // [foliage] SNAP_SOFT_PARTICLES: full-resolution particle targets
+    t->scale *= std::max(folBoost, HdfxBoost(t, *tb, tag));   // HD effects (nvn_hdfx.cpp)
+    RetargetNote(t, tag, folBoost);   // live size rows (nvn_retarget.cpp)
+    { uint64_t rel[8]; for (int i = 0; i < nChain; i++) rel[i] = chain[i] - kGuestMain; HdfxAuditCreate(t, rel, nChain); }
     if (tag == kTagEvalDepth) ModelNoteEvalDepth(t);   // nvn_model.cpp: the evaluation pass draws original meshes
     { uint64_t rel[8]; for (int i = 0; i < nChain; i++) rel[i] = chain[i] - kGuestMain; UpscaleTagTexture(t, rel, nChain, tag); }   // [upscale]
     if (g_scale.scale != 1.0f || g_scale.shadowRes) { static const bool lg = getenv("SNAP_SCALE_LOG") != nullptr; if (lg && (tb->width >= 192 || t->scale != 1.0f)) {
@@ -295,6 +298,7 @@ void TextureFinalize(void* tex) {
     if (t->acctPool) PoolAcct(t->acctPool, t->acctVa, -t->acctBytes);
     if (t->arenaSlot >= 0) ArenaUnacct(t->arenaSlot, t->arenaBytes);
     RetargetGone(t);            // live size rows
+    HdfxAuditGone(t);
     TexPrefetchForget(t);       // [perf] a prefetch job may be reading its guest data: stop it now (the guest frees the storage)
     UpscaleForgetTexture(t);    // [upscale]
     FoliageTextureGone(t);      // [foliage]
@@ -658,14 +662,18 @@ float ScalePolicy::For(const TextureBuilder& b, uint32_t tag) const {
   // depth target is not a window texture and keeps its exemption below.
   if ((b.flags & TF_DISPLAY) && displayScale > 0.f) return (b.target == TT_2D && b.samples <= 1) ? displayScale : 1.0f;   // [upscale] output size
   if (b.flags & TF_DISPLAY) return (scaleDisplay && b.target == TT_2D && b.samples <= 1) ? scale : 1.0f;
-  if (!(b.flags & TF_COMPRESSIBLE) || (b.flags & (TF_DISPLAY | TF_LINEAR | TF_LINEAR_RENDER_TARGET))) return 1.0f;   // not a plain render target
-  if (b.target != TT_2D && b.target != TT_2D_ARRAY) return 1.0f;
-  if (b.samples > 1) return 1.0f;
-  if (tag) for (uint32_t t : exemptTags) if (t == tag) return 1.0f;
+  return Follows(b, tag) ? scale : 1.0f;
+}
+bool ScalePolicy::Follows(const TextureBuilder& b, uint32_t tag) const {
+  if (IsDepthFmt(b.format) && (b.target == TT_2D || b.target == TT_2D_ARRAY) && b.width == 1024 && b.height == 1024 && b.samples <= 1) return false;
+  if (!(b.flags & TF_COMPRESSIBLE) || (b.flags & (TF_DISPLAY | TF_LINEAR | TF_LINEAR_RENDER_TARGET))) return false;
+  if (b.target != TT_2D && b.target != TT_2D_ARRAY) return false;
+  if (b.samples > 1) return false;
+  if (tag) for (uint32_t t : exemptTags) if (t == tag) return false;
   for (const Exempt& e : exempt) {
-    if ((e.w < 0 || e.w == b.width) && (e.h < 0 || e.h == b.height) && (e.fmt < 0 || e.fmt == b.format) && (!e.depthOnly || IsDepthFmt(b.format))) return 1.0f;
+    if ((e.w < 0 || e.w == b.width) && (e.h < 0 || e.h == b.height) && (e.fmt < 0 || e.fmt == b.format) && (!e.depthOnly || IsDepthFmt(b.format))) return false;
   }
-  return scale;
+  return true;
 }
 }  // namespace nvn
 namespace nvn {
@@ -686,7 +694,8 @@ void ApplyHostEnvPolicy() {
   if (const char* e = getenv("SNAP_LOD_BIAS")) {
     if (nvn::os_host::ascii_ieq(e, "auto")) g_lodBiasAuto = true; else { g_lodBiasExtra = (float)atof(e); g_lodBiasAuto = false; }
   } else g_lodBiasAuto = g_scale.scale != 1.0f || (g_scale.displayScale > 0.f && g_scale.displayScale != 1.0f);   // [upscale] scene 1.0, output 2.0: bias -1
-  Log("host policy: scale=%.2f shadowRes=%d aniso=%.0f lodBias=%s%.2f", g_scale.scale, g_scale.shadowRes, g_anisoOverride, g_lodBiasAuto ? "auto " : "", g_lodBiasExtra);
+  HdfxInit();
+  Log("host policy: scale=%.2f shadowRes=%d aniso=%.0f lodBias=%s%.2f hdEffects=%.2f", g_scale.scale, g_scale.shadowRes, g_anisoOverride, g_lodBiasAuto ? "auto " : "", g_lodBiasExtra, g_scale.hd);
 }
 // Live options: the two sampler overrides read again (the auto mip bias follows the render scale as at start).
 bool SamplerPolicyReparse() {

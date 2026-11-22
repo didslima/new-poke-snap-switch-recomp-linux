@@ -30,6 +30,15 @@ Code: `runtime/nvn/nvn_wide.cpp` (the draw rules), `host/mods/lodanim.cpp` (`wid
 - The rounded viewfinder frame the game darkens around the view during camera moments is stretched with the view (the original draws it at about 12% to 88% of the width and height, and it keeps those fractions).
 - Menus, photo select, the evaluation screens and videos show 16:9 with side bars.
 
+## Owner follow-up: 32:9 transitions (2026-11-20)
+
+Observed on a 5120x1440 display (`k = 2`). These are future investigation items; none is implemented or verified yet.
+
+1. **Startup aspect transition.** The game initially renders at 16:9, then switches to 32:9. Investigate whether the widescreen window dimensions and ultrawide factor can be applied before the first guest frame, avoiding the visible switch.
+2. **Gray panel after “Press any button to start.”** A gray panel appears centered in the 16:9 area and disappears after the switch to 32:9. Investigate extending its gray background across the remaining left and right screen areas while preserving its centered content. Reference: [`ultrawide-startup-gray-panel.png`](screenshots/ultrawide-startup-gray-panel.png).
+3. **Course intro / Skip screen.** Before ride control begins, the screen with the Skip button renders at 16:9. Investigate widening that scene or transition to avoid the brief pillarboxed presentation.
+4. **Professor photo evaluation.** The evaluation itself is expected to remain 16:9. However, a very brief 32:9 frame appears during the transition and causes a noticeable flash. Investigate keeping the present crop at 16:9 throughout the transition, without changing the evaluation view.
+
 ## Known limits
 
 - **Photo records keep the widened projection.** Only the Evaluation's copy is changed; the records themselves still hold aspect 16/9 x k. Check (Florio, `score_time_a`, memory scans after the Score screen): at k = 2 without the fix, the Evaluation cameras were at aspect 3.0 (m00 1.02589, m11 3.07768). With the fix, no camera at aspect 1.5 x k is left. The Evaluation cameras read m00 2.05179, m11 3.07768, m8, m9 and m10 0, m14 0.01, the same values as an Off run (k = 1), and 5.84533 / 8.768 when zoomed. Scores were not compared on the same photo: a save state cannot change k, and rides are not repeatable.

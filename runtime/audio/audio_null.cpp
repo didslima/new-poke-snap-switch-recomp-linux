@@ -49,4 +49,8 @@ class NullBackend : public Backend {
 
 Backend* make_null_backend() { return new NullBackend(); }
 
+#if !defined(_WIN32)
+std::vector<std::string> list_render_devices() { return {}; }
+#endif
+
 }  // namespace snap_audio
